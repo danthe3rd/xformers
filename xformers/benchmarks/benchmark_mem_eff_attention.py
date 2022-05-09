@@ -29,8 +29,8 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
-    # itertools.product([1, 8, 256], [1024], [32])
-    itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
+    itertools.product([8], [128, 1024], [32, 64, 128])
+    # itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
 )
 
 results = []
@@ -41,8 +41,9 @@ def benchmark_forward(args):
     optimized_label =  "optimized" if args.label is None else args.label
     results = []
     if args.compare is not None:
-        with open(f"{args.compare}.pkl", "rb") as fd:
-            results += pickle.load(fd)
+        for name in args.compare.split(","):
+            with open(f"{name}.pkl", "rb") as fd:
+                results += pickle.load(fd)
 
     print(f"Processing {len(SHAPES)} cases")
     print("Forward")
@@ -53,7 +54,7 @@ def benchmark_forward(args):
             q = torch.rand(shape, device=device)
             sub_label = f"B={B}, M={M}, K={K}"
 
-            if True:
+            if False:
                 r = xformers.ops.memory_efficient_attention(q, q, q)
 
                 rr = ref_attention(q, q, q)

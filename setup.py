@@ -75,7 +75,7 @@ def get_extensions():
     include_dirs = [
         extensions_dir,
         os.path.join(
-            this_dir, "cutlass", "include"
+            this_dir, "third_party", "cutlass", "include"
         )
     ]
 

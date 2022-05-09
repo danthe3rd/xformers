@@ -227,3 +227,29 @@ The following repositories are used in xFormers, either in close to original for
 * [RevTorch](https://github.com/RobinBruegger/RevTorch)
 * [Nystromformer](https://github.com/mlpen/Nystromformer)
 * [FairScale](https://github.com/facebookresearch/fairscale/)
+
+## dhaziza debug log:
+```
+module load cuda/11.6 cudnn/v8.1.1.33-cuda.11.0
+conda install -c nvidia/label/cuda-11.6.2 cuda-toolkit
+conda install -c anaconda cudnn -y
+conda install -c pytorch magma-cuda116 -y
+# Build triton from source
+pip install pyyaml
+# Build pytorch from source: https://github.com/pytorch/pytorch#from-source
+
+# Build cutlass
+export CMAKE_PREFIX_PATH=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}
+git clone git@github.com:NVIDIA/cutlass.git
+mkdir cutlass/build && cd cutlass/build && cmake .. && make -j50
+# OR just
+conda install -c conda-forge cutlass
+
+# Finally build xformers
+python3 setup.py clean && python3 setup.py develop
+```
+
+TEST:
+```
+python3 setup.py develop && python3 xformers/benchmarks/benchmark_mem_eff_attention.py
+```

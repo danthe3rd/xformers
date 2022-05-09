@@ -4,9 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 
+from cProfile import label
 import itertools
 import pprint
 from typing import Dict
+import argparse
+import pickle
+from collections import defaultdict
+
 
 import torch
 from torch.utils import benchmark
@@ -24,14 +29,21 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
+    # itertools.product([1, 8, 256], [1024], [32])
     itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
 )
 
 results = []
-mem_use: Dict[str, Dict[str, float]] = dict(optimized={}, vanilla={})
+mem_use: Dict[str, Dict[str, float]] = defaultdict(dict)
 
 
-def benchmark_forward():
+def benchmark_forward(args):
+    optimized_label =  "optimized" if args.label is None else args.label
+    results = []
+    if args.compare is not None:
+        with open(f"{args.compare}.pkl", "rb") as fd:
+            results += pickle.load(fd)
+
     print(f"Processing {len(SHAPES)} cases")
     print("Forward")
     for num_threads in NUM_THREADS:
@@ -57,17 +69,17 @@ def benchmark_forward():
                         "fn": xformers.ops.memory_efficient_attention,
                     },
                     label="attention",
-                    description="optimized",
+                    description=optimized_label,
                     sub_label=sub_label,
                     num_threads=num_threads,
                 ).blocked_autorange(min_run_time=min_run_time)
             )
             torch.cuda.synchronize()
             memory = torch.cuda.max_memory_allocated() / 2 ** 20
-            mem_use["optimized"][sub_label] = memory
+            mem_use[optimized_label][sub_label] = memory
             memory_str = f"Memory used: {memory} MB"
 
-            print("Optimized", memory_str)
+            print(optimized_label, memory_str)
 
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -94,6 +106,11 @@ def benchmark_forward():
     compare = benchmark.Compare(results)
     compare.print()
 
+    if args.label is not None:
+        with open(f"{args.label}.pkl", "wb+") as fd:
+            pickle.dump([
+                r for r in results if r.description == optimized_label
+            ], fd)
     pprint.pprint(mem_use)
 
 
@@ -171,6 +188,10 @@ def benchmark_backward():
 
     pprint.pprint(mem_use)
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--label", default=None, type=str, help="Store results to a file")
+parser.add_argument("--compare", default=None, type=str, help="Compare to a previously stored benchmark")
+args = parser.parse_args()
 
-benchmark_forward()
-benchmark_backward()
+benchmark_forward(args)
+# benchmark_backward()

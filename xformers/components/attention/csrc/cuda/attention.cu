@@ -1269,7 +1269,7 @@ struct GemmParams {
 
   // NOTE: Ratio between the 2 following shapes gives num_warps (here 1)
   using ThreadblockShape = cutlass::gemm::GemmShape<16, 16, 8>;
-  using WarpShape = cutlass::gemm::GemmShape<8, 8, 8>;
+  using WarpShape = cutlass::gemm::GemmShape<16, 16, 8>;
   using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
   // Define the MmaCore components
@@ -1389,7 +1389,7 @@ at::Tensor launch(
   int64_t N = key.size(1);
   at::Tensor out = at::zeros({query.size(0), M, N}, query.options());
   dim3 grid(query.size(0), ceil_div(M, int64_t(P::ThreadblockShape::kM)));
-  dim3 block(NUM_WARPS, 4);
+  dim3 block(NUM_WARPS, 1);
 
   kernel_cutlass<float, float><<<grid, block>>>(
       query.packed_accessor<float, 3>(),

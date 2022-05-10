@@ -35,7 +35,22 @@ SHAPES = list(
 
 results = []
 mem_use: Dict[str, Dict[str, float]] = defaultdict(dict)
+def on_exception_enter_postmortem(f):
+    import pdb
+    import sys
+    from functools import wraps
+    import traceback
 
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as exception:
+            traceback.print_exc()
+            pdb.post_mortem(sys.exc_info()[2])
+            raise
+
+    return wrapper
 
 def benchmark_forward(args):
     optimized_label =  "optimized" if args.label is None else args.label
@@ -189,10 +204,100 @@ def benchmark_backward():
 
     pprint.pprint(mem_use)
 
+@on_exception_enter_postmortem
+def benchmark_matmull(args):
+    def ref_implem(a, b):
+        return torch.matmul(a, b.transpose(2, 1))
+
+    a = torch.tensor([[1.0, 0], [-1, 0], [0, 100]], device=device).unsqueeze(0)
+    b = torch.tensor([[2.0, 3], [5, 7]], device=device).transpose(1, 0).contiguous().unsqueeze(0)
+    r1 = ref_implem(a, b)
+    r2 = torch.ops.xformers.dhaziza_custom_matmull(a, b)
+    print("r1\n", r1)
+    print("r2\n", r2)
+    assert (r1 - r2).abs().max() < 1e-4, (r1 - r2).abs().max()
+
+    optimized_label =  "optimized" if args.label is None else args.label
+    results = []
+    if args.compare is not None:
+        for name in args.compare.split(","):
+            with open(f"{name}.pkl", "rb") as fd:
+                results += pickle.load(fd)
+
+
+    print(f"Processing {len(SHAPES)} cases")
+    print("Forward")
+    for num_threads in NUM_THREADS:
+        for shape in SHAPES:
+            print(f"===== {shape} =====")
+            B, M, K = shape
+            q = torch.rand(shape, device=device)
+            sub_label = f"B={B}, M={M}, K={K}"
+
+            if True:
+                r = torch.ops.xformers.dhaziza_custom_matmull(q, q)
+                rr = ref_implem(q, q)
+                assert (r - rr).abs().max() < 1e-4, (r - rr).abs().max()
+
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            results.append(
+                benchmark.Timer(
+                    stmt="fn(q, q)",
+                    globals={
+                        "q": q,
+                        "fn": torch.ops.xformers.dhaziza_custom_matmull,
+                    },
+                    label="attention",
+                    description=optimized_label,
+                    sub_label=sub_label,
+                    num_threads=num_threads,
+                ).blocked_autorange(min_run_time=min_run_time)
+            )
+            torch.cuda.synchronize()
+            memory = torch.cuda.max_memory_allocated() / 2 ** 20
+            mem_use[optimized_label][sub_label] = memory
+            memory_str = f"Memory used: {memory} MB"
+
+            print(optimized_label, memory_str)
+
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            results.append(
+                benchmark.Timer(
+                    stmt="fn(q, q)",
+                    globals={
+                        "q": q,
+                        "fn": ref_implem,
+                    },
+                    label="attention",
+                    description="vanilla_matmull",
+                    sub_label=sub_label,
+                    num_threads=num_threads,
+                ).blocked_autorange(min_run_time=min_run_time)
+            )
+
+            torch.cuda.synchronize()
+            memory = torch.cuda.max_memory_allocated() / 2 ** 20
+            mem_use["vanilla"][sub_label] = memory
+            memory_str = f"Memory used: {memory} MB"
+            print("Vanilla", memory_str)
+
+    compare = benchmark.Compare(results)
+    compare.print()
+
+    if args.label is not None:
+        with open(f"{args.label}.pkl", "wb+") as fd:
+            pickle.dump([
+                r for r in results if r.description == optimized_label
+            ], fd)
+    pprint.pprint(mem_use)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--label", default=None, type=str, help="Store results to a file")
 parser.add_argument("--compare", default=None, type=str, help="Compare to a previously stored benchmark")
 args = parser.parse_args()
 
-benchmark_forward(args)
+# benchmark_forward(args)
 # benchmark_backward()
+benchmark_matmull(args)

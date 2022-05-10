@@ -9,6 +9,25 @@
 
 #include "sputnik/vector_utils.h"
 
+
+// ...
+#include "cutlass/aligned_buffer.h"
+#include "cutlass/gemm/gemm.h"
+#include "cutlass/layout/matrix.h"
+#include "cutlass/layout/vector.h"
+#include "cutlass/numeric_types.h"
+
+#include "cutlass/core_io.h"
+
+#include "cutlass/gemm/threadblock/default_mma_core_simt.h"
+#include "cutlass/gemm/threadblock/default_mma_core_sm75.h"
+#include "cutlass/gemm/threadblock/default_mma_core_sm70.h"
+#include "cutlass/transform/threadblock/predicated_tile_iterator.h"
+#include "cutlass/cutlass.h"
+#include "cutlass/matrix_shape.h"
+#include "cutlass/platform/platform.h"
+//...
+
 namespace {
 
 template <typename integer>
@@ -245,6 +264,14 @@ __device__ void compute_loop(
   scalar_t si[kBlockSizeQ][kBlockSizeK] = {0};
   compute_dot<scalar_t, vec_t, kBlockSizeK, kBlockSizeQ>(
       query_block, key_i, si, K);
+  
+  // for (int i = 0; i < kBlockSizeQ; ++i) {
+  //   for (int j = 0; j < kBlockSizeK; ++j) {
+  //     iMul(si[i][j], &buffer[i][j % BUFFER_SIZE]);
+  //   }
+  // }
+  // return;
+
 
   scalar_t m_i[kBlockSizeQ];
   compute_max<scalar_t, kBlockSizeK, kBlockSizeQ>(si, m_prime, m_i);
@@ -462,15 +489,17 @@ void launch_attention(
 
   constexpr int WARP_SIZE = 4;
 
-  constexpr int kBlockSizeK = 32;
-  constexpr int kBlockSizeQ = 2;
+ constexpr int kBlockSizeK = 32;
+ constexpr int kBlockSizeQ = 2;
 
   constexpr int TILE_SIZE = 32;
-  constexpr int BUFFER_SIZE = 8;
+  constexpr int BUFFER_SIZE = 32;
+//  constexpr int BUFFER_SIZE = 8;
+
 
   dim3 grid(ceil_div(M, int64_t(TILE_SIZE)), B);
-  static_assert(WARP_SIZE * TILE_SIZE / kBlockSizeQ <= 512);
-  dim3 block(WARP_SIZE, TILE_SIZE / kBlockSizeQ);
+  constexpr dim3 block(WARP_SIZE, TILE_SIZE / kBlockSizeQ);
+  static_assert(block.x * block.y <= 512);
 
   using scalar_t = float;
 
@@ -1134,6 +1163,242 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_backward(
   return std::make_tuple(grad_q, grad_k, grad_v);
 }
 
+namespace dhaziza_custom_matmull {
+constexpr auto NUM_WARPS = 32u;
+
+template <
+    typename scalar_t,
+    typename vec_t>
+__global__ void kernel_naive(
+    at::PackedTensorAccessor<scalar_t, 2> query,
+    at::PackedTensorAccessor<scalar_t, 2> key,
+    at::PackedTensorAccessor<scalar_t, 2> out) {
+  int64_t M = query.size(0);
+  int64_t K = query.size(1);
+  int64_t N = key.size(0);
+  for (int64_t n = threadIdx.x; n < N; n += NUM_WARPS) {
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t k = 0; k < K; ++k) {
+        out[m][n] += query[m][k] * key[n][k];
+      }
+    }
+  }
+}
+
+// Copy pasted from
+// https://github.com/NVIDIA/cutlass/blob/v2.9.0/test/unit/gemm/threadblock/mma_pipelined_testbed.h
+// and
+// https://github.com/NVIDIA/cutlass/blob/v2.9.0/test/unit/gemm/threadblock/mma_pipelined_simt.cu 
+template <typename Mma>
+__device__ void kernel_mma(cutlass::gemm::GemmCoord problem_size,
+                           typename Mma::IteratorA::Params params_A,
+                           typename Mma::IteratorA::TensorRef ref_A,
+                           typename Mma::IteratorB::Params params_B,
+                           typename Mma::IteratorB::TensorRef ref_B,
+                           typename Mma::ElementC *ptr_C,
+                           typename Mma::LayoutC::Stride::Index ldc,
+                           int64_t blockAxisN) {
+  // Shared storage needed by threadblock-scoped matrix multiply-accumulate
+  __shared__ typename Mma::SharedStorage shared_storage;
+
+  // Compute threadblock location
+  cutlass::gemm::GemmCoord tb_tile_offset = {
+    int(blockIdx.y), // M
+    int(blockAxisN), // int(blockIdx.y), // N
+    0 // K
+  };
+
+  cutlass::MatrixCoord tb_offset_A{tb_tile_offset.m() * Mma::Shape::kM,
+                                   tb_tile_offset.k()};
+
+  cutlass::MatrixCoord tb_offset_B{tb_tile_offset.k(),
+                                   tb_tile_offset.n() * Mma::Shape::kN};
+
+  // Compute position within threadblock
+  int tb_thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+
+  // Construct iterators to A and B operands
+  typename Mma::IteratorA iterator_A(params_A, ref_A.data(),
+                                     {problem_size.m(), problem_size.k()},
+                                     tb_thread_id, tb_offset_A);
+
+  typename Mma::IteratorB iterator_B(params_B, ref_B.data(),
+                                     {problem_size.k(), problem_size.n()},
+                                     tb_thread_id, tb_offset_B);
+
+  int warp_id = threadIdx.y;
+  int lane_id = threadIdx.x;
+  assert(Mma::WarpCount::kM * Mma::WarpCount::kN * Mma::WarpCount::kK == blockDim.y);
+
+  // Construct thread-scoped matrix multiply
+  Mma mma(shared_storage, tb_thread_id, warp_id, threadIdx.x);
+
+  typename Mma::FragmentC accum;
+
+  accum.clear();
+
+  int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+
+  // Compute threadblock-scoped matrix multiply-add
+  mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
+
+  // Output results
+  typename Mma::Operator::IteratorC iterator_C({ptr_C, ldc}, lane_id);
+
+  iterator_C.add_tile_offset(
+      {(tb_tile_offset.m() * Mma::WarpCount::kM) +
+           (warp_id % Mma::WarpCount::kM),
+       (tb_tile_offset.n() * Mma::WarpCount::kN) +
+           (warp_id / Mma::WarpCount::kM)});
+
+  iterator_C.store(accum);
+}
+
+
+template <
+    typename scalar_t,
+    typename vec_t>
+struct GemmParams {
+  using ElementA = float; // cutlass::half_t;
+  using LayoutA = cutlass::layout::RowMajor;
+  using ElementB = float; // cutlass::half_t;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using ElementC = float;
+  using LayoutC = cutlass::layout::RowMajor;
+
+
+  // NOTE: Ratio between the 2 following shapes gives num_warps (here 1)
+  using ThreadblockShape = cutlass::gemm::GemmShape<16, 16, 8>;
+  using WarpShape = cutlass::gemm::GemmShape<8, 8, 8>;
+  using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+
+  // Define the MmaCore components
+  static const int kStages = 2;
+  using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+      ThreadblockShape,    // ThreadblockShape,
+      WarpShape,    // WarpShape,
+      InstructionShape,      // InstructionShape,
+      ElementA,                                  // ElementA,
+      LayoutA,           // LayoutA,
+      ElementB,                                  // ElementB,
+      LayoutB,              // LayoutB,
+      ElementC,                                  // ElementC,
+      LayoutC,              // LayoutC,
+      // Just use `cutlass::arch::OpClassTensorOp` for TensorCores (requires sm>7.0)
+      cutlass::arch::OpClassSimt,             // OpClass,
+      kStages,                                      // Stages,
+      cutlass::arch::OpMultiplyAdd            // Operator,
+      >;
+    
+
+  using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
+          cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
+          ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA>;
+
+  // Define iterators over tiles from the B operand
+  using IteratorB = cutlass::transform::threadblock::PredicatedTileIterator<
+          cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>,
+          ElementB, LayoutB, 0, typename MmaCore::IteratorThreadMapB>;
+
+  // Define MmaPipeline Single Stage
+  using MmaPipelineSingleStage =  cutlass::gemm::threadblock::MmaSingleStage<
+      typename MmaCore::Shape, IteratorA, typename MmaCore::SmemIteratorA,
+      IteratorB, typename MmaCore::SmemIteratorB, ElementC, LayoutC,
+      typename MmaCore::MmaPolicy>;
+
+  // Define MmaPipeline Two Stages
+  using MmaPipelineTwoStages =  cutlass::gemm::threadblock::MmaPipelined<
+      typename MmaCore::Shape, IteratorA, typename MmaCore::SmemIteratorA,
+      IteratorB, typename MmaCore::SmemIteratorB, ElementC, LayoutC,
+      typename MmaCore::MmaPolicy>;
+  
+  // Define the threadblock-scoped pipelined matrix multiply (Select between Single vs. Two stages)
+  using Mma = typename cutlass::platform::conditional<(kStages==1), MmaPipelineSingleStage, MmaPipelineTwoStages>::type;
+};
+
+template <
+    typename scalar_t,
+    typename vec_t>
+__device__ void kernel_cutlass_single(
+    at::TensorAccessor<scalar_t, 2> query,
+    at::TensorAccessor<scalar_t, 2> key,
+    at::TensorAccessor<scalar_t, 2> out) {
+
+  using P = GemmParams<scalar_t, vec_t>;
+
+  // cutlass::gemm::GemmCoord problem_size(64, 64, 128);
+  // using ThreadblockShape = cutlass::gemm::GemmShape<64, 64, 32>;
+  // using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+  // using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
+  cutlass::gemm::GemmCoord problem_size(query.size(0), key.size(0), query.size(1));
+  typename P::IteratorA::Params params_A(typename P::LayoutA(query.stride(0)));
+  typename P::IteratorA::TensorRef ref_A(
+    &query[0][0],
+    query.stride(0)
+  );
+
+  typename P::IteratorB::Params params_B(typename P::LayoutB(key.stride(0)));
+  typename P::IteratorB::TensorRef ref_B(
+    &key[0][0],
+    key.stride(0)
+  );
+
+  int64_t nBlocksN = ceil_div(key.size(0), int64_t(P::ThreadblockShape::kN));
+  for (int64_t n = 0; n < nBlocksN; ++n) {
+    kernel_mma<P::Mma>(
+        problem_size,
+        params_A, ref_A,
+        params_B, ref_B,
+        &out[0][0], out.stride(0),
+        n
+    );
+  }
+}
+
+
+template <
+    typename scalar_t,
+    typename vec_t>
+__global__ void kernel_cutlass(
+    at::PackedTensorAccessor<scalar_t, 3> query,
+    at::PackedTensorAccessor<scalar_t, 3> key,
+    at::PackedTensorAccessor<scalar_t, 3> out) {
+  at::TensorAccessor<scalar_t, 2> query_s = query[blockIdx.x];
+  kernel_cutlass_single<scalar_t, vec_t>(query_s, key[blockIdx.x], out[blockIdx.x]);
+}
+
+at::Tensor launch(
+    const at::Tensor& query,
+    const at::Tensor& key
+) {
+  TORCH_CHECK(query.is_cuda(), "query must be a CUDA tensor");
+  TORCH_CHECK(key.is_cuda(), "key must be a CUDA tensor");
+
+  TORCH_CHECK(!query.is_sparse(), "query must be a dense tensor");
+  TORCH_CHECK(!key.is_sparse(), "key must be a dense tensor");
+
+  TORCH_CHECK(query.is_contiguous());
+  TORCH_CHECK(key.is_contiguous());
+
+  at::cuda::CUDAGuard device_guard(query.device());
+
+  using P = GemmParams<float, float>;
+
+  int64_t M = query.size(1);
+  int64_t K = query.size(2);
+  int64_t N = key.size(1);
+  at::Tensor out = at::zeros({query.size(0), M, N}, query.options());
+  dim3 grid(query.size(0), ceil_div(M, int64_t(P::ThreadblockShape::kM)));
+  dim3 block(NUM_WARPS, 4);
+
+  kernel_cutlass<float, float><<<grid, block>>>(
+      query.packed_accessor<float, 3>(),
+      key.packed_accessor<float, 3>(),
+      out.packed_accessor<float, 3>());
+  return out;
+}
+}
+
 } // namespace
 
 TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
@@ -1143,4 +1408,7 @@ TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("xformers::efficient_attention_backward"),
       TORCH_FN(attention_backward));
+  m.impl(
+      TORCH_SELECTIVE_NAME("xformers::dhaziza_custom_matmull"),
+      TORCH_FN(dhaziza_custom_matmull::launch));
 }

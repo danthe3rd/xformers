@@ -29,8 +29,9 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
-    itertools.product([8], [128, 1024], [32, 64, 128])
+    # itertools.product([8], [128, 1024], [32, 64, 128])
     # itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
+    itertools.product([8], [127, 128, 512, 513, 1023, 1024], [32])
 )
 
 results = []
@@ -52,6 +53,7 @@ def on_exception_enter_postmortem(f):
 
     return wrapper
 
+@on_exception_enter_postmortem
 def benchmark_forward(args):
     optimized_label =  "optimized" if args.label is None else args.label
     results = []
@@ -223,6 +225,8 @@ def benchmark_matmull(args):
         for name in args.compare.split(","):
             with open(f"{name}.pkl", "rb") as fd:
                 results += pickle.load(fd)
+                for r in results:
+                    r.description = name
 
 
     print(f"Processing {len(SHAPES)} cases")
@@ -298,6 +302,6 @@ parser.add_argument("--label", default=None, type=str, help="Store results to a 
 parser.add_argument("--compare", default=None, type=str, help="Compare to a previously stored benchmark")
 args = parser.parse_args()
 
-# benchmark_forward(args)
+benchmark_forward(args)
 # benchmark_backward()
-benchmark_matmull(args)
+# benchmark_matmull(args)

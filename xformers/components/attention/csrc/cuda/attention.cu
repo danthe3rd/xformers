@@ -264,14 +264,6 @@ __device__ void compute_loop(
   scalar_t si[kBlockSizeQ][kBlockSizeK] = {0};
   compute_dot<scalar_t, vec_t, kBlockSizeK, kBlockSizeQ>(
       query_block, key_i, si, K);
-  
-  // for (int i = 0; i < kBlockSizeQ; ++i) {
-  //   for (int j = 0; j < kBlockSizeK; ++j) {
-  //     iMul(si[i][j], &buffer[i][j % BUFFER_SIZE]);
-  //   }
-  // }
-  // return;
-
 
   scalar_t m_i[kBlockSizeQ];
   compute_max<scalar_t, kBlockSizeK, kBlockSizeQ>(si, m_prime, m_i);
@@ -1185,6 +1177,8 @@ __global__ void kernel_naive(
   }
 }
 
+namespace dhaziza_custom_matmull {
+
 // Copy pasted from
 // https://github.com/NVIDIA/cutlass/blob/v2.9.0/test/unit/gemm/threadblock/mma_pipelined_testbed.h
 // and
@@ -1228,10 +1222,9 @@ __device__ void kernel_mma(cutlass::gemm::GemmCoord problem_size,
 
   int warp_id = threadIdx.y;
   int lane_id = threadIdx.x;
-  assert(Mma::WarpCount::kM * Mma::WarpCount::kN * Mma::WarpCount::kK == blockDim.y);
 
   // Construct thread-scoped matrix multiply
-  Mma mma(shared_storage, tb_thread_id, warp_id, threadIdx.x);
+  Mma mma(shared_storage, tb_thread_id, warp_id, lane_id);
 
   typename Mma::FragmentC accum;
 
@@ -1267,9 +1260,16 @@ struct GemmParams {
   using LayoutC = cutlass::layout::RowMajor;
 
 
-  // NOTE: Ratio between the 2 following shapes gives num_warps (here 1)
-  using ThreadblockShape = cutlass::gemm::GemmShape<16, 16, 8>;
-  using WarpShape = cutlass::gemm::GemmShape<16, 16, 8>;
+  // cutlass::gemm::GemmCoord problem_size(64, 64, 128);
+  // using ThreadblockShape = cutlass::gemm::GemmShape<64, 64, 32>;
+  // using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+  // using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
+
+  // NOTE: Ratio between the 2 following shapes gives num_warps
+  // Playing with these numbers can greatly improve/degrade performance
+  // NOTE: Using 8 as first dim gives incorrect result
+  using ThreadblockShape = cutlass::gemm::GemmShape<32, 64, 8>;
+  using WarpShape = cutlass::gemm::GemmShape<32, 32, 8>;
   using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
   // Define the MmaCore components
@@ -1289,6 +1289,7 @@ struct GemmParams {
       kStages,                                      // Stages,
       cutlass::arch::OpMultiplyAdd            // Operator,
       >;
+  static constexpr int kNumWarps = MmaCore::WarpCount::kM * MmaCore::WarpCount::kN * MmaCore::WarpCount::kK;
     
 
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
@@ -1326,10 +1327,6 @@ __device__ void kernel_cutlass_single(
 
   using P = GemmParams<scalar_t, vec_t>;
 
-  // cutlass::gemm::GemmCoord problem_size(64, 64, 128);
-  // using ThreadblockShape = cutlass::gemm::GemmShape<64, 64, 32>;
-  // using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
-  // using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
   cutlass::gemm::GemmCoord problem_size(query.size(0), key.size(0), query.size(1));
   typename P::IteratorA::Params params_A(typename P::LayoutA(query.stride(0)));
   typename P::IteratorA::TensorRef ref_A(
@@ -1389,7 +1386,7 @@ at::Tensor launch(
   int64_t N = key.size(1);
   at::Tensor out = at::zeros({query.size(0), M, N}, query.options());
   dim3 grid(query.size(0), ceil_div(M, int64_t(P::ThreadblockShape::kM)));
-  dim3 block(NUM_WARPS, 1);
+  dim3 block(32, P::kNumWarps);
 
   kernel_cutlass<float, float><<<grid, block>>>(
       query.packed_accessor<float, 3>(),

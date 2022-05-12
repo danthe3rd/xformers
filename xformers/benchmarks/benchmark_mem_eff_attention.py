@@ -11,7 +11,7 @@ from typing import Dict
 import argparse
 import pickle
 from collections import defaultdict
-
+import os
 
 import torch
 from torch.utils import benchmark
@@ -68,14 +68,16 @@ def benchmark_forward(args):
         for shape in SHAPES:
             print(f"===== {shape} =====")
             B, M, K = shape
+            B, M, K = 1, 16, 16
             q = torch.rand(shape, device=device)
             sub_label = f"B={B}, M={M}, K={K}"
 
-            if False:
+            if True:
                 r = xformers.ops.memory_efficient_attention(q, q, q)
 
                 rr = ref_attention(q, q, q)
                 assert (r - rr).abs().max() < 1e-5
+                continue
 
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -301,6 +303,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--label", default=None, type=str, help="Store results to a file")
 parser.add_argument("--compare", default=None, type=str, help="Compare to a previously stored benchmark")
 args = parser.parse_args()
+
+print(f"cuda-gdb -p {os.getpid()}")
+input("Enter any key to start ...")
 
 benchmark_forward(args)
 # benchmark_backward()

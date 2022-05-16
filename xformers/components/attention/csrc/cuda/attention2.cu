@@ -42,7 +42,9 @@ struct AttentionKernel {
     static constexpr int64_t kNumWarpsPerBlock = 2;
     static constexpr int64_t kKeysPerWarp = kWarpSize;
     static constexpr int64_t kValuesPerWarp = kWarpSize * kNumWarpsPerBlock;
-    
+
+    static constexpr int64_t kSiDim1 = kNumWarpsPerBlock * kKeysPerWarp;
+
     static_assert(kKeysPerWarp % kWarpSize == 0);
     static_assert(kValuesPerWarp % kWarpSize == 0);
     static_assert(kValuesPerWarp == (kWarpSize * kNumWarpsPerBlock), "not implemented yet");
@@ -100,7 +102,7 @@ struct AttentionKernel {
         scalar_t __shared__ m_prime[kQueriesPerBlock];
         scalar_t __shared__ mi[kQueriesPerBlock][kNumWarpsPerBlock];
         scalar_t __shared__ s_prime[kQueriesPerBlock];
-        scalar_t __shared__ si[kQueriesPerBlock][kNumWarpsPerBlock * kKeysPerWarp];
+        scalar_t __shared__ si[kQueriesPerBlock][kSiDim1];
         // ArrayWithBoundsChecks<kQueriesPerBlock> m_prime(m_prime_);
         // ArrayWithBoundsChecks2d<kQueriesPerBlock, kNumWarpsPerBlock> mi(mi_);
         // ArrayWithBoundsChecks<kQueriesPerBlock> s_prime(s_prime_);
@@ -164,8 +166,8 @@ struct AttentionKernel {
 
             // 5. `m_prime` <- `mi`
             if (warp_id == 0) {
-                for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
-                    m_prime[q + lane_id] = mi[q + lane_id][0];
+                for (int64_t q = thread_id(); q < kQueriesPerBlock; q += kWarpSize * kNumWarpsPerBlock) { // parallel lanes
+                    m_prime[q] = mi[q][0];
                 }
             }
         }
@@ -188,7 +190,7 @@ struct AttentionKernel {
         int64_t iter_key_start,
         at::TensorAccessor<scalar_t, 2> value,
         scalar_t m_prime[kQueriesPerBlock],
-        scalar_t si[kQueriesPerBlock][kNumWarpsPerBlock * kKeysPerWarp],
+        scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock],
         at::TensorAccessor<scalar_t, 2> output
     ) {
@@ -229,7 +231,7 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> query,
         at::TensorAccessor<scalar_t, 2> key,
         scalar_t m_prime[kQueriesPerBlock],
-        scalar_t si[kQueriesPerBlock][kNumWarpsPerBlock * kKeysPerWarp],
+        scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
     ) {
         /*
@@ -281,7 +283,7 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> query,
         at::TensorAccessor<scalar_t, 2> key,
         scalar_t m_prime[kQueriesPerBlock],
-        scalar_t si[kQueriesPerBlock][kNumWarpsPerBlock * kKeysPerWarp],
+        scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
     ) {
         /*
@@ -319,7 +321,7 @@ struct AttentionKernel {
             problem_size,
             params_A, ref_A,
             params_B, ref_B,
-            &si[0][0], kNumWarpsPerBlock * kKeysPerWarp,
+            &si[0][0], kSiDim1,
             0, // blockAxisN
             0 // blockAxisM
         );

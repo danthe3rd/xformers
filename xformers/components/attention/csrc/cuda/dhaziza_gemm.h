@@ -158,8 +158,8 @@ struct GemmParams {
   // NOTE: Ratio between the 2 following shapes gives num_warps
   // Playing with these numbers can greatly improve/degrade performance
   // NOTE: Using 8 as first dim gives incorrect result
-  using ThreadblockShape = cutlass::gemm::GemmShape<16, 64, 8>;
-  using WarpShape = cutlass::gemm::GemmShape<16, 32, 8>;
+  using ThreadblockShape = cutlass::gemm::GemmShape<32, 64, 8>;
+  using WarpShape = cutlass::gemm::GemmShape<32, 32, 8>;
   using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
   // Define the MmaCore components

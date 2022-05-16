@@ -39,7 +39,7 @@ struct AttentionKernel {
     }
     // Threads
     static constexpr int64_t kWarpSize = 32;
-    static constexpr int64_t kNumWarpsPerBlock = 2;
+    static constexpr int64_t kNumWarpsPerBlock = 4;
     static constexpr int64_t kKeysPerWarp = kWarpSize;
     static constexpr int64_t kValuesPerWarp = kWarpSize * kNumWarpsPerBlock;
 
@@ -226,6 +226,7 @@ struct AttentionKernel {
         }
     }
 
+#if 0
     static __device__ void compute_dot_product_qk(
         int64_t iter_key_start,
         at::TensorAccessor<scalar_t, 2> query,
@@ -276,9 +277,8 @@ struct AttentionKernel {
             mi[q][warp_id()] = currentMax;
         }
     }
-
-#if 0
-    static __device__ void compute_dot_product_qk_cutlass(
+#else
+    static __device__ void compute_dot_product_qk(
         int64_t iter_key_start,
         at::TensorAccessor<scalar_t, 2> query,
         at::TensorAccessor<scalar_t, 2> key,
@@ -293,39 +293,155 @@ struct AttentionKernel {
         (b) key[iter_key_start:iter_key_start + kNumWarpsPerBlock * kKeysPerWarp]
         and stores that into `si`
         */
-        using namespace dhaziza_custom_matmull;
-        using P = GemmParams<float>;
+
+        // class "cutlass::gemm::threadblock::MmaBase<Shape_, Policy_, Stages, Enable>::SharedStorage [with
+        // Shape_=cutlass::gemm::GemmShape<16, 64, 8>,
+        // Policy_=cutlass::gemm::threadblock::MmaPolicy<cutlass::gemm::warp::MmaSimt<cutlass::gemm::GemmShape<16, 32, 8>, float, cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor, cutlass::gemm::warp::MmaSimtPolicy<cutlass::MatrixShape<4, 8>, cutlass::layout::RowMajorInterleaved<1>, cutlass::gemm::GemmShape<4, 4, 1>>, 1, cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone, __nv_bool>, cutlass::MatrixShape<4, 0>, cutlass::MatrixShape<0, 4>, 1>,
+        // Stages=2, Enable=__nv_bool]" has no member "something_made_up"
+
+        // FragmentC = cutlass::Array<float, 16, true>
+
+        using ThreadblockShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, 8>;
+        using WarpShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerWarp, 8>;
+        using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+
+        using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+            ThreadblockShape,                       // ThreadblockShape,
+            WarpShape,                              // WarpShape,
+            InstructionShape,                       // InstructionShape,
+            float,                                  // ElementA,
+            cutlass::layout::RowMajor,              // LayoutA,
+            float,                                  // ElementB,
+            cutlass::layout::ColumnMajor,           // LayoutB,
+            float,                                  // ElementC,
+            cutlass::layout::RowMajor,              // LayoutC,
+            // Just use `cutlass::arch::OpClassTensorOp` for TensorCores (requires sm>7.0)
+            cutlass::arch::OpClassSimt,             // OpClass,
+            2,                                      // Stages,
+            cutlass::arch::OpMultiplyAdd            // Operator,
+            >;
+
+        using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
+                cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
+                MmaCore::ElementA, MmaCore::LayoutA, 1, typename MmaCore::IteratorThreadMapA>;
+
+        // Define iterators over tiles from the B operand
+        using IteratorB = cutlass::transform::threadblock::PredicatedTileIterator<
+                cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>,
+                MmaCore::ElementB, MmaCore::LayoutB, 0, typename MmaCore::IteratorThreadMapB>;
+
+
+        using Mma = cutlass::gemm::threadblock::MmaPipelined<
+            typename MmaCore::Shape, IteratorA, typename MmaCore::SmemIteratorA,
+            IteratorB, typename MmaCore::SmemIteratorB, MmaCore::ElementC, MmaCore::LayoutC,
+            typename MmaCore::MmaPolicy>;
+
 
         int64_t num_queries = query.size(0);
         int64_t K = key.size(1);
 
         // TODO: Handle non optimal matrix sizes
         cutlass::gemm::GemmCoord problem_size(kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, K);
-        typename P::IteratorA::Params params_A(typename P::LayoutA(query.stride(0)));
-        typename P::IteratorA::TensorRef ref_A(
+        IteratorA::Params params_A(typename MmaCore::LayoutA(query.stride(0)));
+        IteratorA::TensorRef ref_A(
             &query[query_start()][0],
             query.stride(0)
         );
 
-        typename P::IteratorB::Params params_B(typename P::LayoutB(key.stride(0)));
-        typename P::IteratorB::TensorRef ref_B(
+        typename IteratorB::Params params_B(typename MmaCore::LayoutB(key.stride(0)));
+        typename IteratorB::TensorRef ref_B(
             &key[iter_key_start][0],
             key.stride(0)
         );
 
-        static_assert(P::ThreadblockShape::kN == kNumWarpsPerBlock * kKeysPerWarp);
-        static_assert(P::ThreadblockShape::kM == kQueriesPerBlock);
-        static_assert(P::kNumWarps == kNumWarpsPerBlock);
-        // scalar_t local_si[kQueriesPerBlock][kNumWarpsPerBlock * kKeysPerWarp]
-        kernel_mma<P::Mma>(
+        static_assert(MmaCore::WarpCount::kM * MmaCore::WarpCount::kN * MmaCore::WarpCount::kK == kNumWarpsPerBlock);
+
+        kernel_mma<Mma>(
             problem_size,
             params_A, ref_A,
             params_B, ref_B,
-            &si[0][0], kSiDim1,
-            0, // blockAxisN
-            0 // blockAxisM
+            &si[0][0], kSiDim1
         );
+        __syncthreads();
+
+        int64_t num_keys = key.size(0);
+        for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
+            int64_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
+            scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
+            scalar_t currentMax = m_prime[q];
+            if (query_start() + q < num_queries) {
+                for (int64_t key_id = 0; key_id < kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
+                    if (key_offset + key_id >= num_keys) {
+                        break;
+                    }
+                    scalar_t dot_product = si[q][warp_id() * kKeysPerWarp + key_id + lane_id()];
+                    dot_product *= scale;
+                    si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;
+
+                    // 2a. At the same time aggregate the max at the warp-level
+                    currentMax = std::max(currentMax, warpMax(dot_product));
+                }
+            }
+            mi[q][warp_id()] = currentMax;
+        }
     }
+
+    template <typename Mma>
+    static __device__ void kernel_mma(cutlass::gemm::GemmCoord problem_size,
+                            typename Mma::IteratorA::Params params_A,
+                            typename Mma::IteratorA::TensorRef ref_A,
+                            typename Mma::IteratorB::Params params_B,
+                            typename Mma::IteratorB::TensorRef ref_B,
+                            typename Mma::ElementC *ptr_C,
+                            typename Mma::LayoutC::Stride::Index ldc) {
+        // Shared storage needed by threadblock-scoped matrix multiply-accumulate
+        __shared__ typename Mma::SharedStorage shared_storage;
+
+        // Compute threadblock location
+        cutlass::gemm::GemmCoord tb_tile_offset = {0, 0, 0};
+
+        cutlass::MatrixCoord tb_offset_A{tb_tile_offset.m() * Mma::Shape::kM,
+                                        tb_tile_offset.k()};
+
+        cutlass::MatrixCoord tb_offset_B{tb_tile_offset.k(),
+                                        tb_tile_offset.n() * Mma::Shape::kN};
+
+        // Construct iterators to A and B operands
+        typename Mma::IteratorA iterator_A(params_A, ref_A.data(),
+                                            {problem_size.m(), problem_size.k()},
+                                            thread_id(), tb_offset_A);
+
+        typename Mma::IteratorB iterator_B(params_B, ref_B.data(),
+                                            {problem_size.k(), problem_size.n()},
+                                            thread_id(), tb_offset_B);
+
+        int my_warp_id = warp_id();
+        int my_lane_id = lane_id();
+
+        // Construct thread-scoped matrix multiply
+        Mma mma(shared_storage, thread_id(), my_warp_id, my_lane_id);
+
+        typename Mma::FragmentC accum;
+
+        accum.clear();
+
+        int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+
+        // Compute threadblock-scoped matrix multiply-add
+        mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
+
+        // Output results
+        typename Mma::Operator::IteratorC iterator_C({ptr_C, ldc}, my_lane_id);
+
+        iterator_C.add_tile_offset(
+            {(tb_tile_offset.m() * Mma::WarpCount::kM) +
+                (my_warp_id % Mma::WarpCount::kM),
+            (tb_tile_offset.n() * Mma::WarpCount::kN) +
+                (my_warp_id / Mma::WarpCount::kM)});
+
+        iterator_C.store(accum);
+    }
+
 #endif
 
     static __device__ __forceinline__ scalar_t warpMax(scalar_t val) {

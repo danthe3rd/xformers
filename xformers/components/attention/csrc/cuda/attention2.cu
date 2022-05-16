@@ -19,6 +19,9 @@
 /*
 Loops unrolling
 Vec load
+
+Gotchas:
+- Don't use at::TensorAccessor in a loop - super slow
 */
 
 
@@ -193,9 +196,11 @@ struct AttentionKernel {
                     // TODO: Warp divergence if K is not good
                     break;
                 }
-                scalar_t current_v = value_col;
+                scalar_t current_v = 0;
+                scalar_t* value_ptr = &value[iter_key_start][value_col + thread_id()];
                 for (int64_t k = 0; k < kNumWarpsPerBlock * kKeysPerWarp; ++k) {
-                    scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
+                    // scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
+                    scalar_t current_value = *(value_ptr + k * K);
                     scalar_t current_si = si[q][k];
                     current_v += current_value * std::exp(current_si - my_mi); // TODO: store in smem?
                 }
@@ -234,8 +239,10 @@ struct AttentionKernel {
                         break;
                     }
                     scalar_t dot_product = 0;
+                    scalar_t* cur_key = &key[key_offset + key_id][0];
+                    scalar_t* cur_query = &query[query_start() + q][0];
                     for (int64_t k = 0; k < K; ++k) {
-                        dot_product += key[key_offset + key_id][k] * query[query_start() + q][k];
+                        dot_product += cur_key[k] * cur_query[k];
                     }
                     dot_product *= scale;
                     si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;

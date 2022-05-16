@@ -15,12 +15,14 @@ import os
 
 import torch
 from torch.utils import benchmark
-
+import nvtx
 import xformers.ops
 
 
 def ref_attention(q, k, v):
-    q = q * (1.0 / q.shape[-1] ** 0.5)
+    scale = 1.0
+    scale  = (1.0 / q.shape[-1] ** 0.5)
+    q = q * scale
     return (q @ k.transpose(-2, -1)).softmax(-1) @ v
 
 
@@ -29,9 +31,9 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
-    # itertools.product([8], [128, 1024], [32, 64, 128])
+    itertools.product([8], [128, 1024], [32, 64, 128])
     # itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
-    itertools.product([8], [127, 128, 512, 513, 1023, 1024], [32])
+    # itertools.product([8], [127, 128, 512, 513, 1023, 1024], [32])
 )
 
 results = []
@@ -63,21 +65,40 @@ def benchmark_forward(args):
                 results += pickle.load(fd)
 
     print(f"Processing {len(SHAPES)} cases")
-    print("Forward")
     for num_threads in NUM_THREADS:
         for shape in SHAPES:
             print(f"===== {shape} =====")
             B, M, K = shape
-            B, M, K = 1, 16, 16
             q = torch.rand(shape, device=device)
             sub_label = f"B={B}, M={M}, K={K}"
 
             if True:
-                r = xformers.ops.memory_efficient_attention(q, q, q)
+                # q = torch.tensor([
+                #     [1., 0],
+                #     [0, 0],
+                #     [0, 1],
+                #     [0, 0]]).unsqueeze(0).to(device)
+                # k = torch.tensor([
+                #     [1., 0],
+                #     [0, 1],
+                #     [0, 0],
+                #     [0, 0]]).unsqueeze(0).to(device)
+                # v = torch.tensor([
+                #     [1., 0],
+                #     [0, 0],
+                #     [0, 1],
+                #     [1, 1]]).unsqueeze(0).to(device)
+                q, k, v = q, q, q
 
-                rr = ref_attention(q, q, q)
+                with nvtx.annotate(sub_label, color="purple"):
+                    r = xformers.ops.memory_efficient_attention2(q, k, v)
+                    torch.cuda.synchronize()
+
+                with nvtx.annotate(f"{sub_label}_vanilla", color="purple"):
+                    rr = ref_attention(q, k, v)
+                    torch.cuda.synchronize()
                 assert (r - rr).abs().max() < 1e-5
-                continue
+                # continue
 
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -86,7 +107,7 @@ def benchmark_forward(args):
                     stmt="fn(q, q, q)",
                     globals={
                         "q": q,
-                        "fn": xformers.ops.memory_efficient_attention,
+                        "fn": xformers.ops.memory_efficient_attention2,
                     },
                     label="attention",
                     description=optimized_label,
@@ -305,7 +326,7 @@ parser.add_argument("--compare", default=None, type=str, help="Compare to a prev
 args = parser.parse_args()
 
 print(f"cuda-gdb -p {os.getpid()}")
-input("Enter any key to start ...")
+# input("Enter any key to start ...")
 
 benchmark_forward(args)
 # benchmark_backward()

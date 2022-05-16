@@ -57,3 +57,17 @@ def memory_efficient_attention(
     if all(x.requires_grad is False for x in [query, key, value]):
         return torch.ops.xformers.efficient_attention(query, key, value, False)[0]
     return _MemoryEfficientAttentionOp.apply(query, key, value)
+
+
+def memory_efficient_attention2(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+):
+    """
+    Implements the memory-efficient attention mechanism following
+    `"Self-Attention Does Not Need O(n^2) Memory" <http://arxiv.org/abs/2112.05682>`_.
+
+    """
+    # fast-path that doesn't require computing the logsumexp for backward computation
+    if all(x.requires_grad is False for x in [query, key, value]):
+        return torch.ops.xformers.efficient_attention2(query, key, value, False)[0]
+    return _MemoryEfficientAttentionOp.apply(query, key, value)

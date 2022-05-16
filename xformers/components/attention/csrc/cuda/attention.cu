@@ -127,7 +127,7 @@ __device__ void compute_dot(
     scalar_t out[kBlockSizeQ][kBlockSizeK],
     int64_t K) {
   constexpr uint64_t kVecSize = sizeof(vec_t) / sizeof(scalar_t);
-#if 0
+#if 1
   scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
   vec_t q_i[kBlockSizeQ];
   for (int64_t k = 0; k < K / kVecSize; k += 1) {
@@ -1210,7 +1210,7 @@ at::Tensor launch(
 
   at::cuda::CUDAGuard device_guard(query.device());
 
-  using P = GemmParams<float, float>;
+  using P = GemmParams<float>;
 
   int64_t M = query.size(1);
   int64_t K = query.size(2);
@@ -1219,7 +1219,7 @@ at::Tensor launch(
   dim3 grid(query.size(0), ceil_div(M, int64_t(P::ThreadblockShape::kM)));
   dim3 block(32, P::kNumWarps);
 
-  kernel_cutlass<float, float><<<grid, block>>>(
+  kernel_cutlass<float><<<grid, block>>>(
       query.packed_accessor<float, 3>(),
       key.packed_accessor<float, 3>(),
       out.packed_accessor<float, 3>());

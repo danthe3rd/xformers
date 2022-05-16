@@ -80,7 +80,7 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> query,
         at::TensorAccessor<scalar_t, 2> key,
         at::TensorAccessor<scalar_t, 2> value) {
-        int64_t thread_id = threadIdx.x + threadIdx.y * blockDim.x;
+        // int64_t thread_id = threadIdx.x + threadIdx.y * blockDim.x;
         // int64_t block_dim = blockDim.x * blockDim.y;
     
         int64_t lane_id = threadIdx.x;
@@ -89,7 +89,7 @@ struct AttentionKernel {
         // In this block, we will only ever:
         // - read query[query_start:query_end, :]
         // - write to output[query_start:query_end, :]
-        int64_t query_start = blockIdx.y * kQueriesPerBlock;
+        // int64_t query_start = blockIdx.y * kQueriesPerBlock;
         // int64_t query_end = (blockIdx.y + 1) * kQueriesPerBlock;
 
         int64_t num_keys = key.size(0);
@@ -171,11 +171,16 @@ struct AttentionKernel {
         }
 
         // 6. Divide by s_prime all of the values
+        const int64_t output_stride0 = output.stride(0);
+        const int64_t last_K_iter = K - thread_id();
+        // &output[query_start()][thread_id]
+        scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
         for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
             scalar_t line_s_prime = s_prime[q];
-            for (int64_t value_col = 0; value_col + thread_id < K; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
-                output[query_start + q][value_col + thread_id] /= line_s_prime;
+            for (int64_t value_col = 0; value_col < last_K_iter; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
+                output_line_ptr[value_col] /= line_s_prime;
             }
+            output_line_ptr += output_stride0;
         }
     }
 
@@ -188,6 +193,13 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> output
     ) {
         int64_t K = value.size(1);
+        scalar_t* value_start_ptr = &value[iter_key_start][0];
+        assert(value.stride(1) == 1);
+
+        scalar_t* output_ptr = &output[query_start()][thread_id()];
+        const int64_t output_stride0 = output.stride(0);
+        assert(output.stride(1) == 1);
+
         for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
             scalar_t my_mi = mi[q][warp_id()];
             scalar_t exp_mprime_mi = std::exp(m_prime[q] - my_mi);
@@ -197,16 +209,18 @@ struct AttentionKernel {
                     break;
                 }
                 scalar_t current_v = 0;
-                scalar_t* value_ptr = &value[iter_key_start][value_col + thread_id()];
+                scalar_t* value_ptr = value_start_ptr + (value_col + thread_id());
                 for (int64_t k = 0; k < kNumWarpsPerBlock * kKeysPerWarp; ++k) {
                     // scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
                     scalar_t current_value = *(value_ptr + k * K);
                     scalar_t current_si = si[q][k];
                     current_v += current_value * std::exp(current_si - my_mi); // TODO: store in smem?
                 }
-                scalar_t v_prime = output[query_start() + q][value_col + thread_id()];
-                output[query_start() + q][value_col + thread_id()] = v_prime * exp_mprime_mi + current_v;
+                // output[query_start() + q][value_col + thread_id()]
+                scalar_t v_prime = output_ptr[value_col];
+                output_ptr[value_col] = v_prime * exp_mprime_mi + current_v;
             }
+            output_ptr += output_stride0;
         }
     }
 
@@ -229,6 +243,11 @@ struct AttentionKernel {
         int64_t num_queries = query.size(0);
         int64_t K = key.size(1);
 
+        scalar_t* key_start_ptr = key.data();
+        int64_t key_stride0 = key.stride(0);
+        scalar_t* query_start_ptr = &query[query_start()][0];
+        int64_t query_stride0 = query.stride(0);
+
         for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
             int64_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
             scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
@@ -239,8 +258,8 @@ struct AttentionKernel {
                         break;
                     }
                     scalar_t dot_product = 0;
-                    scalar_t* cur_key = &key[key_offset + key_id][0];
-                    scalar_t* cur_query = &query[query_start() + q][0];
+                    scalar_t* cur_key = key_start_ptr + (key_offset + key_id) * key_stride0;
+                    scalar_t* cur_query = query_start_ptr + q * query_stride0;
                     for (int64_t k = 0; k < K; ++k) {
                         dot_product += cur_key[k] * cur_query[k];
                     }

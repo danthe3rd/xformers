@@ -145,13 +145,19 @@ struct AttentionKernel {
             __syncthreads(); // `mi` calculation done based on block data. `mi[a][i] == mi[a][j]` for all (a, i, j)
 
             // TODO: Maybe this could be parallelized across warps
+            // WARNING: This modifies `si` and `m_prime` to store the precalculated exp version
+            // so we can reuse it later in `compute_dot_product_att_value`
             if (warp_id == 0) {
                 for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
                     // 3. Update s_prime
                     scalar_t my_mi = mi[q + lane_id][warp_id];
-                    scalar_t sp = s_prime[q + lane_id] * std::exp(m_prime[q + lane_id] - my_mi);
+                    scalar_t m_prime_exp = std::exp(m_prime[q + lane_id] - my_mi);
+                    scalar_t sp = s_prime[q + lane_id] * m_prime_exp;
+                    m_prime[q + lane_id] = m_prime_exp;
                     for (int64_t key_id = 0; key_id < kNumWarpsPerBlock * kKeysPerWarp; ++key_id) {
-                        sp += std::exp(si[q + lane_id][key_id] - my_mi);
+                        scalar_t si_exp = std::exp(si[q + lane_id][key_id] - my_mi);
+                        sp += si_exp;
+                        si[q + lane_id][key_id] = si_exp;
                     }
                     s_prime[q + lane_id] = sp;
                 }
@@ -204,7 +210,8 @@ struct AttentionKernel {
 
         for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
             scalar_t my_mi = mi[q][warp_id()];
-            scalar_t exp_mprime_mi = std::exp(m_prime[q] - my_mi);
+            scalar_t exp_mprime_mi = m_prime[q];
+
             for (int64_t value_col = 0; value_col < K; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
                 if (value_col + thread_id() >= K) {
                     // TODO: Warp divergence if K is not good
@@ -216,7 +223,7 @@ struct AttentionKernel {
                     // scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
                     scalar_t current_value = *(value_ptr + k * K);
                     scalar_t current_si = si[q][k];
-                    current_v += current_value * std::exp(current_si - my_mi); // TODO: store in smem?
+                    current_v += current_value * current_si;
                 }
                 // output[query_start() + q][value_col + thread_id()]
                 scalar_t v_prime = output_ptr[value_col];

@@ -1,4 +1,5 @@
 /*
+--generate-line-info
 TORCH_CUDA_ARCH_LIST="6.0;7.0" NVCC_FLAGS="-g -G" python3 setup.py develop && \
 python3 xformers/benchmarks/benchmark_mem_eff_attention.py --compare main,boundschecks --label nobs
 

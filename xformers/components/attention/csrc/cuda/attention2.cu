@@ -26,6 +26,52 @@ Gotchas:
 
 
 namespace {
+
+
+template <typename P>
+class PredicatedTileIteratorFromSharedMemory : public P {
+ public:
+
+    using P::P;
+
+  CUTLASS_DEVICE
+  void load_with_byte_offset(typename P::Fragment &frag, typename P::LongIndex byte_offset) {
+
+    using AccessType = typename P::AccessType;
+    constexpr auto kAccessesPerVector = P::kAccessesPerVector;
+
+    AccessType *frag_ptr = reinterpret_cast<AccessType *>(&frag);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < P::ThreadMap::Iterations::kStrided; ++s) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int c = 0; c < P::ThreadMap::Iterations::kContiguous; ++c) {
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int v = 0; v < kAccessesPerVector; ++v) {
+
+          int idx = v + kAccessesPerVector * (c + s * P::ThreadMap::Iterations::kContiguous);
+          
+          P::address_iterator_.set_iteration_index(idx);
+          char const *byte_ptr = reinterpret_cast<char const *>(P::address_iterator_.get()) + byte_offset;
+
+          AccessType const *access_ptr = reinterpret_cast<AccessType const *>(byte_ptr);
+          if (P::address_iterator_.valid()) {
+              frag_ptr[idx] = *access_ptr;
+          }
+
+        //   cutlass::arch::global_load<AccessType,
+        //                              sizeof(AccessType)
+        //                             >(
+        //       frag_ptr[idx], access_ptr, address_iterator_.valid());
+
+          ++P::address_iterator_;
+        }
+      }
+    }
+  }
+};
+
 template <typename scalar_t_, bool compute_logsumexp_>
 struct AttentionKernel {
     using scalar_t = scalar_t_;
@@ -41,13 +87,10 @@ struct AttentionKernel {
     static constexpr int64_t kWarpSize = 32;
     static constexpr int64_t kNumWarpsPerBlock = 4;
     static constexpr int64_t kKeysPerWarp = kWarpSize;
-    static constexpr int64_t kValuesPerWarp = kWarpSize * kNumWarpsPerBlock;
 
     static constexpr int64_t kSiDim1 = kNumWarpsPerBlock * kKeysPerWarp;
 
     static_assert(kKeysPerWarp % kWarpSize == 0);
-    static_assert(kValuesPerWarp % kWarpSize == 0);
-    static_assert(kValuesPerWarp == (kWarpSize * kNumWarpsPerBlock), "not implemented yet");
 
     // Sort of sanitizers to ensure we always access within bounds
     template <int kDim>
@@ -181,17 +224,21 @@ struct AttentionKernel {
         // 6. Divide by s_prime all of the values
         const int64_t output_stride0 = output.stride(0);
         const int64_t last_K_iter = K - thread_id();
-        // &output[query_start()][thread_id]
-        scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
-        for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
-            scalar_t line_s_prime = s_prime[q];
-            for (int64_t value_col = 0; value_col < last_K_iter; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
-                output_line_ptr[value_col] /= line_s_prime;
+        if (thread_id() < output.size(0) && last_K_iter > 0) {
+            // &output[query_start()][thread_id]
+            scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
+            for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
+                scalar_t line_s_prime = s_prime[q];
+                for (int64_t value_col = 0; value_col < last_K_iter; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
+                    output_line_ptr[value_col] /= line_s_prime;
+                }
+                output_line_ptr += output_stride0;
             }
-            output_line_ptr += output_stride0;
         }
     }
 
+#if 0
+    // Naive version
     static __device__ void compute_dot_product_att_value(
         int64_t iter_key_start,
         at::TensorAccessor<scalar_t, 2> value,
@@ -223,7 +270,7 @@ struct AttentionKernel {
                     // scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
                     scalar_t current_value = *(value_ptr + k * K);
                     scalar_t current_si = si[q][k];
-                    current_v += current_value * current_si;
+                    current_v += current_value * current_si; // LONG SCOREBOARD bottleneck
                 }
                 // output[query_start() + q][value_col + thread_id()]
                 scalar_t v_prime = output_ptr[value_col];
@@ -232,6 +279,155 @@ struct AttentionKernel {
             output_ptr += output_stride0;
         }
     }
+#else
+    // cutlass version
+    static __device__ void compute_dot_product_att_value(
+        int64_t iter_key_start,
+        at::TensorAccessor<scalar_t, 2> value,
+        scalar_t m_prime[kQueriesPerBlock],
+        scalar_t si[kQueriesPerBlock][kSiDim1],
+        scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock],
+        at::TensorAccessor<scalar_t, 2> output
+    ) {
+        using ThreadblockShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, 8>;
+        using WarpShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerWarp, 8>;
+        using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+
+        using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+            ThreadblockShape,                       // ThreadblockShape,
+            WarpShape,                              // WarpShape,
+            InstructionShape,                       // InstructionShape,
+            float,                                  // ElementA,
+            cutlass::layout::RowMajor,              // LayoutA,
+            float,                                  // ElementB,
+            cutlass::layout::RowMajor,              // LayoutB,
+            float,                                  // ElementC,
+            cutlass::layout::RowMajor,              // LayoutC,
+            // Just use `cutlass::arch::OpClassTensorOp` for TensorCores (requires sm>7.0)
+            cutlass::arch::OpClassSimt,             // OpClass,
+            2,                                      // Stages,
+            cutlass::arch::OpMultiplyAdd            // Operator,
+            >;
+
+        using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
+                cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
+                MmaCore::ElementA, MmaCore::LayoutA, 1, typename MmaCore::IteratorThreadMapA>;
+
+        // Define iterators over tiles from the B operand
+        using IteratorB = cutlass::transform::threadblock::PredicatedTileIterator<
+                cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>,
+                MmaCore::ElementB, MmaCore::LayoutB, 0, typename MmaCore::IteratorThreadMapB>;
+
+
+        using Mma = cutlass::gemm::threadblock::MmaPipelined<
+            typename MmaCore::Shape, IteratorA, typename MmaCore::SmemIteratorA,
+            IteratorB, typename MmaCore::SmemIteratorB, MmaCore::ElementC, MmaCore::LayoutC,
+            typename MmaCore::MmaPolicy>;
+
+
+        cutlass::gemm::GemmCoord problem_size(
+            std::min((int64_t)kQueriesPerBlock, output.size(0) - query_start()),
+            value.size(1),
+            std::min(kNumWarpsPerBlock * kKeysPerWarp, value.size(0) - iter_key_start)
+        );
+        typename IteratorA::Params params_A(kSiDim1);
+        typename IteratorA::TensorRef ref_A(
+            &si[0][0],
+            kSiDim1
+        );
+
+        typename IteratorB::Params params_B(typename MmaCore::LayoutB(value.stride(0)));
+        typename IteratorB::TensorRef ref_B(
+            &value[iter_key_start][0],
+            value.stride(0)
+        );
+
+        static_assert(MmaCore::WarpCount::kM * MmaCore::WarpCount::kN * MmaCore::WarpCount::kK == kNumWarpsPerBlock);
+
+        const int64_t nBlockN = ceil_div((int64_t)problem_size.n(), int64_t(ThreadblockShape::kN));
+        for (int64_t blockN = 0; blockN < nBlockN; ++blockN) {
+            // Shared storage needed by threadblock-scoped matrix multiply-accumulate
+            __shared__ typename Mma::SharedStorage shared_storage;
+
+            // Compute threadblock location
+            cutlass::gemm::GemmCoord tb_tile_offset = {0, blockN, 0};
+
+            cutlass::MatrixCoord tb_offset_A{tb_tile_offset.m() * Mma::Shape::kM,
+                                            tb_tile_offset.k()};
+
+            cutlass::MatrixCoord tb_offset_B{tb_tile_offset.k(),
+                                            tb_tile_offset.n() * Mma::Shape::kN};
+
+            // Construct iterators to A and B operands
+            typename Mma::IteratorA iterator_A(params_A, ref_A.data(),
+                                                {problem_size.m(), problem_size.k()},
+                                                thread_id(), tb_offset_A);
+
+            typename Mma::IteratorB iterator_B(params_B, ref_B.data(),
+                                                {problem_size.k(), problem_size.n()},
+                                                thread_id(), tb_offset_B);
+
+            int my_warp_id = warp_id();
+            int my_lane_id = lane_id();
+
+            // Construct thread-scoped matrix multiply
+            Mma mma(shared_storage, thread_id(), my_warp_id, my_lane_id);
+
+            // Output results
+            // cutlass::gemm::warp::MmaSimtTileIterator<cutlass::MatrixShape<16, 32>, cutlass::gemm::Operand::kC, float, cutlass::layout::RowMajor, cutlass::gemm::warp::MmaSimtPolicy<cutlass::MatrixShape<4, 8>, cutlass::layout::RowMajorInterleaved<1>, cutlass::gemm::GemmShape<4, 4, 1>>, 1, 1>
+            typename Mma::Operator::IteratorC iterator_C({&output[query_start()][0], output.stride(0)}, my_lane_id);
+            auto iterator_C_offset_n = (tb_tile_offset.m() * Mma::WarpCount::kM) +
+                    (my_warp_id % Mma::WarpCount::kM);
+            using LaneMmaShape = typename Mma::Policy;
+            typename Mma::Operator::IteratorC::Policy::LaneLayout lane_layout = Mma::Operator::IteratorC::Policy::get_lane_layout();
+            cutlass::MatrixCoord lane_offset = lane_layout.inverse(my_lane_id) * cutlass::MatrixCoord(Mma::Operator::IteratorC::Policy::LaneMmaShape::kM, 0);
+            auto lane_id_offset_n = lane_offset.row();
+            iterator_C.add_tile_offset(
+                {iterator_C_offset_n,
+                (tb_tile_offset.n() * Mma::WarpCount::kN) +
+                    (my_warp_id / Mma::WarpCount::kM)});
+        
+            typename Mma::FragmentC accum; // cutlass::Array<float, 16, true>
+            // Pre-init accum with values from `output`
+            // and multiply by `m_prime[q]`
+            iterator_C.load(accum);
+
+
+            // TODO: Handle bounds checks, handle different accum types (eg for Tensor Cores), and more
+            multiply_frag_by(m_prime, iterator_C_offset_n + lane_id_offset_n, iterator_C, accum);
+            int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+
+            // Compute threadblock-scoped matrix multiply-add
+            mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
+
+            iterator_C.store(accum);
+        }
+    }
+
+    template <typename Fragment, typename Iterator>
+    static void __device__ multiply_frag_by(scalar_t mult[kQueriesPerBlock], int32_t offset, Iterator const& iterator, Fragment& frag) {
+        using Policy = typename Iterator::Policy;
+        using Delta = typename Iterator::Delta;
+        using Iterations = typename Iterator::Iterations;
+        using Element = typename Iterator::Element;
+
+        static_assert(Fragment::kStorageElements == kQueriesPerBlock);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int mma_m = 0; mma_m < Iterations::kRow; ++mma_m) { // 0
+            CUTLASS_PRAGMA_UNROLL
+            for (int m = 0; m < Policy::LaneMmaShape::kM; ++m) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int mma_n = 0; mma_n < Iterations::kColumn; ++mma_n) {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int l = 0; l < Policy::LaneMmaShape::kN; ++l) {
+                        frag.at(l + Policy::LaneMmaShape::kN * (mma_n + Iterations::kColumn * (m + mma_m * Policy::LaneMmaShape::kM))) *= mult[offset + m];
+                    }
+                }
+            }
+        }
+    }
+#endif
 
 #if 0
     static __device__ void compute_dot_product_qk(

@@ -31,7 +31,7 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
-    itertools.product([8], [128, 1024], [32, 64, 128])
+    itertools.product([8], [128, 1024, 2048], [32, 64, 128, 256])
     # itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
     # itertools.product([8], [127, 128, 512, 513, 1023, 1024], [32])
 )

@@ -294,13 +294,6 @@ struct AttentionKernel {
         and stores that into `si`
         */
 
-        // class "cutlass::gemm::threadblock::MmaBase<Shape_, Policy_, Stages, Enable>::SharedStorage [with
-        // Shape_=cutlass::gemm::GemmShape<16, 64, 8>,
-        // Policy_=cutlass::gemm::threadblock::MmaPolicy<cutlass::gemm::warp::MmaSimt<cutlass::gemm::GemmShape<16, 32, 8>, float, cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor, cutlass::gemm::warp::MmaSimtPolicy<cutlass::MatrixShape<4, 8>, cutlass::layout::RowMajorInterleaved<1>, cutlass::gemm::GemmShape<4, 4, 1>>, 1, cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone, __nv_bool>, cutlass::MatrixShape<4, 0>, cutlass::MatrixShape<0, 4>, 1>,
-        // Stages=2, Enable=__nv_bool]" has no member "something_made_up"
-
-        // FragmentC = cutlass::Array<float, 16, true>
-
         using ThreadblockShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, 8>;
         using WarpShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerWarp, 8>;
         using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
@@ -340,8 +333,11 @@ struct AttentionKernel {
         int64_t num_queries = query.size(0);
         int64_t K = key.size(1);
 
-        // TODO: Handle non optimal matrix sizes
-        cutlass::gemm::GemmCoord problem_size(kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, K);
+        cutlass::gemm::GemmCoord problem_size(
+            std::min((int64_t)kQueriesPerBlock, num_queries - query_start()),
+            std::min(kNumWarpsPerBlock * kKeysPerWarp, key.size(0) - iter_key_start),
+            K
+        );
         IteratorA::Params params_A(typename MmaCore::LayoutA(query.stride(0)));
         IteratorA::TensorRef ref_A(
             &query[query_start()][0],
@@ -356,7 +352,7 @@ struct AttentionKernel {
 
         static_assert(MmaCore::WarpCount::kM * MmaCore::WarpCount::kN * MmaCore::WarpCount::kK == kNumWarpsPerBlock);
 
-        kernel_mma<Mma>(
+        cutlass_mma<Mma>(
             problem_size,
             params_A, ref_A,
             params_B, ref_B,
@@ -385,9 +381,10 @@ struct AttentionKernel {
             mi[q][warp_id()] = currentMax;
         }
     }
+#endif
 
     template <typename Mma>
-    static __device__ void kernel_mma(cutlass::gemm::GemmCoord problem_size,
+    static __device__ void cutlass_mma(cutlass::gemm::GemmCoord problem_size,
                             typename Mma::IteratorA::Params params_A,
                             typename Mma::IteratorA::TensorRef ref_A,
                             typename Mma::IteratorB::Params params_B,
@@ -441,8 +438,6 @@ struct AttentionKernel {
 
         iterator_C.store(accum);
     }
-
-#endif
 
     static __device__ __forceinline__ scalar_t warpMax(scalar_t val) {
         for (int stride = kWarpSize / 2; stride > 0; stride >>= 1) {

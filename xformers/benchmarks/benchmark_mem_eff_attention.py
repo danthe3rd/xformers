@@ -31,7 +31,7 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = list(
-    itertools.product([8], [128, 1024, 2048], [32, 64, 128, 256])
+    itertools.product([8], [64, 127, 128, 256, 2048, 4096], [8, 16, 32, 128, 256])
     # itertools.product([1, 8, 32, 256], [127, 128, 512, 513, 1023, 1024], [16, 32])
     # itertools.product([8], [127, 128, 512, 513, 1023, 1024], [32])
 )
@@ -70,25 +70,15 @@ def benchmark_forward(args):
             print(f"===== {shape} =====")
             B, M, K = shape
             q = torch.rand(shape, device=device)
+            v = torch.rand(shape, device=device)
+            k = torch.rand(shape, device=device)
             sub_label = f"B={B}, M={M}, K={K}"
 
             if True:
-                # q = torch.tensor([
-                #     [1., 0],
-                #     [0, 0],
-                #     [0, 1],
-                #     [0, 0]]).unsqueeze(0).to(device)
-                # k = torch.tensor([
-                #     [1., 0],
-                #     [0, 1],
-                #     [0, 0],
-                #     [0, 0]]).unsqueeze(0).to(device)
-                # v = torch.tensor([
-                #     [1., 0],
-                #     [0, 0],
-                #     [0, 1],
-                #     [1, 1]]).unsqueeze(0).to(device)
-                q, k, v = q, q, q
+                # q = torch.tensor([[1., 0],[0, 0],[0, 1],[0, 0]]).unsqueeze(0).to(device)
+                # k = torch.tensor([[1., 0],[0, 1],[0, 0],[0, 0]]).unsqueeze(0).to(device)
+                # v = torch.tensor([[1., 0],[0, 0],[0, 1],[1, 1]]).unsqueeze(0).to(device)
+                # q, k, v = q, q, q
 
                 with nvtx.annotate(sub_label, color="purple"):
                     r = xformers.ops.memory_efficient_attention2(q, k, v)

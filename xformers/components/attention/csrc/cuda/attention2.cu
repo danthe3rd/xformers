@@ -198,7 +198,7 @@ struct AttentionKernel {
                     scalar_t sp = s_prime[q + lane_id] * m_prime_exp;
                     m_prime[q + lane_id] = m_prime_exp;
                     for (int64_t key_id = 0; key_id < kNumWarpsPerBlock * kKeysPerWarp; ++key_id) {
-                        scalar_t si_exp = std::exp(si[q + lane_id][key_id] - my_mi);
+                        scalar_t si_exp = std::exp(si[q + lane_id][key_id] - my_mi) * (key_id < num_keys);
                         sp += si_exp;
                         si[q + lane_id][key_id] = si_exp;
                     }
@@ -223,13 +223,14 @@ struct AttentionKernel {
 
         // 6. Divide by s_prime all of the values
         const int64_t output_stride0 = output.stride(0);
-        const int64_t last_K_iter = K - thread_id();
-        if (thread_id() < output.size(0) && last_K_iter > 0) {
+        const int64_t iter_col_last = output.size(1) - thread_id();
+        const int64_t iter_query_last = std::min((int64_t)kQueriesPerBlock, num_queries - query_start());
+        if (iter_col_last > 0 && iter_query_last > 0) {
             // &output[query_start()][thread_id]
             scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
-            for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
+            for (int64_t q = 0; q < iter_query_last; ++q) {
                 scalar_t line_s_prime = s_prime[q];
-                for (int64_t value_col = 0; value_col < last_K_iter; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
+                for (int64_t value_col = 0; value_col < iter_col_last; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
                     output_line_ptr[value_col] /= line_s_prime;
                 }
                 output_line_ptr += output_stride0;
@@ -293,6 +294,7 @@ struct AttentionKernel {
         using WarpShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerWarp, 8>;
         using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
+        // default_mma_core_simt.h
         using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
             ThreadblockShape,                       // ThreadblockShape,
             WarpShape,                              // WarpShape,
@@ -326,9 +328,9 @@ struct AttentionKernel {
 
 
         cutlass::gemm::GemmCoord problem_size(
-            std::min((int64_t)kQueriesPerBlock, output.size(0) - query_start()),
-            value.size(1),
-            std::min(kNumWarpsPerBlock * kKeysPerWarp, value.size(0) - iter_key_start)
+            std::min((int64_t)kQueriesPerBlock, output.size(0) - query_start()), // M
+            value.size(1), // N
+            std::min(kNumWarpsPerBlock * kKeysPerWarp, value.size(0) - iter_key_start) // K
         );
         typename IteratorA::Params params_A(kSiDim1);
         typename IteratorA::TensorRef ref_A(
@@ -383,26 +385,37 @@ struct AttentionKernel {
             using LaneMmaShape = typename Mma::Policy;
             typename Mma::Operator::IteratorC::Policy::LaneLayout lane_layout = Mma::Operator::IteratorC::Policy::get_lane_layout();
             cutlass::MatrixCoord lane_offset = lane_layout.inverse(my_lane_id) * cutlass::MatrixCoord(Mma::Operator::IteratorC::Policy::LaneMmaShape::kM, Mma::Operator::IteratorC::Policy::LaneMmaShape::kN);
-            auto lane_id_offset_n = lane_offset.row();
             iterator_C.add_tile_offset({iterator_C_offset_m, iterator_C_offset_n});
         
             typename Mma::FragmentC accum; // cutlass::Array<float, 16, true>
-            // Pre-init accum with values from `output`
-            // and multiply by `m_prime[q]`
-            iterator_C.load(accum);
+            // TODO: We could avoid all this mess using cutlass's Epilogue concept I think
+            // but I got lost in templates and reimplemented everything
 
             const int64_t thread_offset_m = Mma::WarpGemm::kM * iterator_C_offset_m + lane_offset.row();
             const int64_t thread_offset_n = Mma::WarpGemm::kN * iterator_C_offset_n + lane_offset.column();
-            iterate_on_frag<Mma::Operator::IteratorC>(accum, 0, 0, [&] (float& accum_v, int32_t m, int32_t n) {
-                accum_v *= m_prime[thread_offset_m + m];
-            });
+            scalar_t* output_ptr = &output[query_start()][0];
+            const int64_t output_s0 = output.stride(0);
+            const int64_t max_m = output.size(0) - query_start();
+            const int64_t max_n = output.size(1);
 
+            // Load data already calculated, and rescale it (as the max value for the softmax might have changed)
+            accum.clear();
+            iterate_on_frag<Mma::Operator::IteratorC>(accum, thread_offset_m, thread_offset_n, [&] (float& accum_v, int32_t m, int32_t n) {
+                if (m < max_m && n < max_n) {
+                    accum_v = output_ptr[m * output_s0 + n] * m_prime[m];
+                }
+            });
             int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
 
             // Compute threadblock-scoped matrix multiply-add
             mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
 
-            iterator_C.store(accum);
+            iterate_on_frag<Mma::Operator::IteratorC>(accum, thread_offset_m, thread_offset_n, [&] (float& accum_v, int32_t m, int32_t n) {
+                if (m < max_m && n < max_n) {
+                    assert(m >= 0 && n >= 0);
+                    output_ptr[m * output_s0 + n] = accum_v;
+                }
+            });
         }
     }
 

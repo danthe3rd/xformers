@@ -171,7 +171,6 @@ struct AttentionKernel {
 
             // 1. Compute dot-product into shared memory for each query
             compute_dot_product_qk(iter_key_start, query, key, m_prime, si, mi);
-            // TODO: Optimize this matmull (cutlass?)
 
             __syncthreads(); // `mi` calculation done based on warp-data
 
@@ -182,7 +181,6 @@ struct AttentionKernel {
                     global_max = std::max(global_max, mi[q + lane_id][other_warp]);
                 }
                 mi[q + lane_id][warp_id] = global_max;
-
             }
 
             __syncthreads(); // `mi` calculation done based on block data. `mi[a][i] == mi[a][j]` for all (a, i, j)
@@ -209,7 +207,6 @@ struct AttentionKernel {
 
             // 4. Partial matmull with the values we have and V
             // `v* <- v* . exp(m* - mi) + v_i . exp(si - mi)`
-            // TODO: Make it efficient matmull
             compute_dot_product_att_value(iter_key_start, value, m_prime, si, mi, output);
             __syncthreads(); // we modify `m_prime` after
 
@@ -491,13 +488,11 @@ struct AttentionKernel {
                     }
                     dot_product *= scale;
                     si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;
-
-                    // 2a. At the same time aggregate the max at the warp-level
-                    scalar_t max_over_warp = std::max(currentMax, warpMax(dot_product));
-                    currentMax = std::max(max_over_warp, dot_product); // TODO(remove)
+                    currentMax = std::max(currentMax, dot_product);
                 }
             }
-            mi[q][warp_id()] = currentMax;
+            // 2a. At the same time aggregate the max at the warp-level
+            mi[q][warp_id()] = warpMax(currentMax);
         }
     }
 #else
@@ -598,10 +593,10 @@ struct AttentionKernel {
                     si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;
 
                     // 2a. At the same time aggregate the max at the warp-level
-                    currentMax = std::max(currentMax, warpMax(dot_product));
+                    currentMax = std::max(currentMax, dot_product);
                 }
             }
-            mi[q][warp_id()] = currentMax;
+            mi[q][warp_id()] = warpMax(currentMax);
         }
     }
 #endif

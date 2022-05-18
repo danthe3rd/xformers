@@ -188,20 +188,22 @@ struct AttentionKernel {
             // TODO: Maybe this could be parallelized across warps
             // WARNING: This modifies `si` and `m_prime` to store the precalculated exp version
             // so we can reuse it later in `compute_dot_product_att_value`
-            if (warp_id == 0) {
-                for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
-                    // 3. Update s_prime
-                    scalar_t my_mi = mi[q + lane_id][warp_id];
-                    scalar_t m_prime_exp = std::exp(m_prime[q + lane_id] - my_mi);
-                    scalar_t sp = s_prime[q + lane_id] * m_prime_exp;
-                    m_prime[q + lane_id] = m_prime_exp;
-                    for (int64_t key_id = 0; key_id < kNumWarpsPerBlock * kKeysPerWarp; ++key_id) {
-                        scalar_t si_exp = std::exp(si[q + lane_id][key_id] - my_mi) * (key_id < num_keys);
-                        sp += si_exp;
-                        si[q + lane_id][key_id] = si_exp;
-                    }
-                    s_prime[q + lane_id] = sp;
+            static_assert(kQueriesPerBlock % kNumWarpsPerBlock == 0, ".. or add a condition to loop below");
+            for (int64_t q = warp_id; q < kQueriesPerBlock; q += kNumWarpsPerBlock) { // parallel warps
+                // 3. Update s_prime
+                scalar_t sp = 0;
+                scalar_t my_mi = mi[q][warp_id];
+                static_assert(kNumWarpsPerBlock * kKeysPerWarp % kWarpSize == 0, ".. or add a condition to loop below");
+                for (int64_t key_id = lane_id; key_id < kNumWarpsPerBlock * kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
+                    scalar_t si_exp = std::exp(si[q][key_id] - my_mi) * (key_id < num_keys);
+                    sp += si_exp;
+                    si[q][key_id] = si_exp;
                 }
+                scalar_t m_prime_exp = std::exp(m_prime[q] - my_mi);
+                sp = warpSum(sp) + s_prime[q] * m_prime_exp;
+
+                m_prime[q] = m_prime_exp;
+                s_prime[q] = sp;
             }
             __syncthreads(); // `s_prime` done
 
@@ -661,6 +663,14 @@ struct AttentionKernel {
         for (int stride = kWarpSize / 2; stride > 0; stride >>= 1) {
             scalar_t tmp = __shfl_xor_sync(0xffffffff, val, stride, kWarpSize);
             val = tmp > val ? tmp : val;
+        }
+        return val;
+    }
+
+    static __device__ __forceinline__ scalar_t warpSum(scalar_t val) {
+        for (int stride = kWarpSize / 2; stride > 0; stride >>= 1) {
+            scalar_t tmp = __shfl_xor_sync(0xffffffff, val, stride, kWarpSize);
+            val += tmp;
         }
         return val;
     }

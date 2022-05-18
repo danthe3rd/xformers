@@ -376,25 +376,27 @@ struct AttentionKernel {
             // Output results
             // cutlass::gemm::warp::MmaSimtTileIterator<cutlass::MatrixShape<16, 32>, cutlass::gemm::Operand::kC, float, cutlass::layout::RowMajor, cutlass::gemm::warp::MmaSimtPolicy<cutlass::MatrixShape<4, 8>, cutlass::layout::RowMajorInterleaved<1>, cutlass::gemm::GemmShape<4, 4, 1>>, 1, 1>
             typename Mma::Operator::IteratorC iterator_C({&output[query_start()][0], output.stride(0)}, my_lane_id);
-            auto iterator_C_offset_n = (tb_tile_offset.m() * Mma::WarpCount::kM) +
+            auto iterator_C_offset_m = (tb_tile_offset.m() * Mma::WarpCount::kM) +
                     (my_warp_id % Mma::WarpCount::kM);
+            auto iterator_C_offset_n = (tb_tile_offset.n() * Mma::WarpCount::kN) +
+                    (my_warp_id / Mma::WarpCount::kM);
             using LaneMmaShape = typename Mma::Policy;
             typename Mma::Operator::IteratorC::Policy::LaneLayout lane_layout = Mma::Operator::IteratorC::Policy::get_lane_layout();
-            cutlass::MatrixCoord lane_offset = lane_layout.inverse(my_lane_id) * cutlass::MatrixCoord(Mma::Operator::IteratorC::Policy::LaneMmaShape::kM, 0);
+            cutlass::MatrixCoord lane_offset = lane_layout.inverse(my_lane_id) * cutlass::MatrixCoord(Mma::Operator::IteratorC::Policy::LaneMmaShape::kM, Mma::Operator::IteratorC::Policy::LaneMmaShape::kN);
             auto lane_id_offset_n = lane_offset.row();
-            iterator_C.add_tile_offset(
-                {iterator_C_offset_n,
-                (tb_tile_offset.n() * Mma::WarpCount::kN) +
-                    (my_warp_id / Mma::WarpCount::kM)});
+            iterator_C.add_tile_offset({iterator_C_offset_m, iterator_C_offset_n});
         
             typename Mma::FragmentC accum; // cutlass::Array<float, 16, true>
             // Pre-init accum with values from `output`
             // and multiply by `m_prime[q]`
             iterator_C.load(accum);
 
+            const int64_t thread_offset_m = Mma::WarpGemm::kM * iterator_C_offset_m + lane_offset.row();
+            const int64_t thread_offset_n = Mma::WarpGemm::kN * iterator_C_offset_n + lane_offset.column();
+            iterate_on_frag<Mma::Operator::IteratorC>(accum, 0, 0, [&] (float& accum_v, int32_t m, int32_t n) {
+                accum_v *= m_prime[thread_offset_m + m];
+            });
 
-            // TODO: Handle bounds checks, handle different accum types (eg for Tensor Cores), and more
-            multiply_frag_by(m_prime, iterator_C_offset_n + lane_id_offset_n, iterator_C, accum);
             int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
 
             // Compute threadblock-scoped matrix multiply-add
@@ -404,8 +406,9 @@ struct AttentionKernel {
         }
     }
 
-    template <typename Fragment, typename Iterator>
-    static void __device__ multiply_frag_by(scalar_t mult[kQueriesPerBlock], int32_t offset, Iterator const& iterator, Fragment& frag) {
+    template <typename Iterator, typename Fragment, typename FN>
+    static void __device__ iterate_on_frag(Fragment& frag, int32_t offset_m, int32_t offset_n, FN callback) {
+        // TODO: This is quite hacky, and only needed for Simt. For other Mmas, we can use epilogue.
         using Policy = typename Iterator::Policy;
         using Delta = typename Iterator::Delta;
         using Iterations = typename Iterator::Iterations;
@@ -420,8 +423,12 @@ struct AttentionKernel {
                 CUTLASS_PRAGMA_UNROLL
                 for (int mma_n = 0; mma_n < Iterations::kColumn; ++mma_n) {
                     CUTLASS_PRAGMA_UNROLL
-                    for (int l = 0; l < Policy::LaneMmaShape::kN; ++l) {
-                        frag.at(l + Policy::LaneMmaShape::kN * (mma_n + Iterations::kColumn * (m + mma_m * Policy::LaneMmaShape::kM))) *= mult[offset + m];
+                    for (int n = 0; n < Policy::LaneMmaShape::kN; ++n) {
+                        callback(
+                            frag.at(n + Policy::LaneMmaShape::kN * (mma_n + Iterations::kColumn * (m + mma_m * Policy::LaneMmaShape::kM))),
+                            offset_m + m + mma_m * Delta::kRow,
+                            offset_n + n + mma_n * Policy::WarpShape::kColumn * Policy::LaneMmaShape::kN
+                        );
                     }
                 }
             }

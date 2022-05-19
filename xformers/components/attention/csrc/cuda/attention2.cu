@@ -696,7 +696,7 @@ __launch_bounds__(
     // maxThreadsPerBlock specifies the maximum number of threads per block with which the application will ever launch
     AK::kWarpSize * AK::kNumWarpsPerBlock,
     // minBlocksPerMultiprocessor is optional and specifies the desired minimum number of resident blocks per multiprocessor
-    3
+    12 / AK::kNumWarpsPerBlock
 )
 attention_kernel_batched(
     at::PackedTensorAccessor<typename AK::scalar_t, 3> output,

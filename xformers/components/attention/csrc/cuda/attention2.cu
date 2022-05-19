@@ -128,8 +128,8 @@ struct AttentionKernel {
         // int64_t thread_id = threadIdx.x + threadIdx.y * blockDim.x;
         // int64_t block_dim = blockDim.x * blockDim.y;
     
-        int64_t lane_id = threadIdx.x;
-        int64_t warp_id = threadIdx.y;
+        int8_t lane_id = threadIdx.x;
+        int8_t warp_id = threadIdx.y;
 
         // In this block, we will only ever:
         // - read query[query_start:query_end, :]
@@ -137,10 +137,10 @@ struct AttentionKernel {
         // int64_t query_start = blockIdx.y * kQueriesPerBlock;
         // int64_t query_end = (blockIdx.y + 1) * kQueriesPerBlock;
 
-        int64_t num_keys = key.size(0);
-        int64_t num_values = value.size(0);
-        int64_t num_queries = query.size(0);
-        int64_t K = key.size(1);
+        int32_t num_keys = key.size(0);
+        int32_t num_values = value.size(0);
+        int32_t num_queries = query.size(0);
+        int32_t K = key.size(1);
 
         scalar_t __shared__ m_prime[kQueriesPerBlock];
         scalar_t __shared__ mi[kQueriesPerBlock][kNumWarpsPerBlock];
@@ -151,18 +151,18 @@ struct AttentionKernel {
         // ArrayWithBoundsChecks<kQueriesPerBlock> s_prime(s_prime_);
         // ArrayWithBoundsChecks2d<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp> si(si_);
 
-        for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
+        for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
             mi[q + lane_id][warp_id] = -std::numeric_limits<scalar_t>::infinity();
         }
         if (warp_id == 0) {
-            for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
+            for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
                 s_prime[q + lane_id] = 0;
                 m_prime[q + lane_id] = -std::numeric_limits<scalar_t>::infinity();
             }
         }
 
         // Iterate through keys
-        for (int64_t iter_key_start = 0; iter_key_start < num_keys; iter_key_start += kNumWarpsPerBlock * kKeysPerWarp) {
+        for (int32_t iter_key_start = 0; iter_key_start < num_keys; iter_key_start += kNumWarpsPerBlock * kKeysPerWarp) {
             // int64_t iter_key_end = iter_key_start + kNumWarpsPerBlock * kKeysPerWarp;
 
             // TODO(half): Shared memory banks are organized such that successive 32-bit words are assigned to successive banks and the bandwidth is 32 bits per bank per clock cycle
@@ -175,9 +175,9 @@ struct AttentionKernel {
             __syncthreads(); // `mi` calculation done based on warp-data
 
             // 2b. Aggregate max across different warps
-            for (int64_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
+            for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
                 scalar_t global_max = mi[q + lane_id][0];
-                for(int64_t other_warp = 0; other_warp < kNumWarpsPerBlock; ++other_warp) {
+                for(int32_t other_warp = 0; other_warp < kNumWarpsPerBlock; ++other_warp) {
                     global_max = std::max(global_max, mi[q + lane_id][other_warp]);
                 }
                 mi[q + lane_id][warp_id] = global_max;
@@ -189,12 +189,12 @@ struct AttentionKernel {
             // WARNING: This modifies `si` and `m_prime` to store the precalculated exp version
             // so we can reuse it later in `compute_dot_product_att_value`
             static_assert(kQueriesPerBlock % kNumWarpsPerBlock == 0, ".. or add a condition to loop below");
-            for (int64_t q = warp_id; q < kQueriesPerBlock; q += kNumWarpsPerBlock) { // parallel warps
+            for (int32_t q = warp_id; q < kQueriesPerBlock; q += kNumWarpsPerBlock) { // parallel warps
                 // 3. Update s_prime
                 scalar_t sp = 0;
                 scalar_t my_mi = mi[q][warp_id];
                 static_assert(kNumWarpsPerBlock * kKeysPerWarp % kWarpSize == 0, ".. or add a condition to loop below");
-                for (int64_t key_id = lane_id; key_id < kNumWarpsPerBlock * kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
+                for (int32_t key_id = lane_id; key_id < kNumWarpsPerBlock * kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
                     scalar_t si_exp = std::exp(si[q][key_id] - my_mi) * (key_id < num_keys);
                     sp += si_exp;
                     si[q][key_id] = si_exp;
@@ -221,15 +221,15 @@ struct AttentionKernel {
         }
 
         // 6. Divide by s_prime all of the values
-        const int64_t output_stride0 = output.stride(0);
-        const int64_t iter_col_last = output.size(1) - thread_id();
-        const int64_t iter_query_last = std::min((int64_t)kQueriesPerBlock, num_queries - query_start());
+        const int32_t output_stride0 = output.stride(0);
+        const int32_t iter_col_last = output.size(1) - thread_id();
+        const int32_t iter_query_last = std::min((int32_t)kQueriesPerBlock, int32_t(num_queries - query_start()));
         if (iter_col_last > 0 && iter_query_last > 0) {
             // &output[query_start()][thread_id]
             scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
-            for (int64_t q = 0; q < iter_query_last; ++q) {
+            for (int32_t q = 0; q < iter_query_last; ++q) {
                 scalar_t line_s_prime = s_prime[q];
-                for (int64_t value_col = 0; value_col < iter_col_last; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
+                for (int32_t value_col = 0; value_col < iter_col_last; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
                     output_line_ptr[value_col] /= line_s_prime;
                 }
                 output_line_ptr += output_stride0;
@@ -240,7 +240,7 @@ struct AttentionKernel {
 #if 0
     // Naive version
     static __device__ void compute_dot_product_att_value(
-        int64_t iter_key_start,
+        iter_key_start const& iter_key_start,
         at::TensorAccessor<scalar_t, 2> value,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
@@ -282,12 +282,12 @@ struct AttentionKernel {
 #else
     // cutlass version
     static __device__ void compute_dot_product_att_value(
-        int64_t iter_key_start,
-        at::TensorAccessor<scalar_t, 2> value,
+        int32_t const& iter_key_start,
+        at::TensorAccessor<scalar_t, 2>& value,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock],
-        at::TensorAccessor<scalar_t, 2> output
+        at::TensorAccessor<scalar_t, 2>& output
     ) {
         using ThreadblockShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, 8>;
         using WarpShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerWarp, 8>;
@@ -368,8 +368,8 @@ struct AttentionKernel {
                                                 {problem_size.k(), problem_size.n()},
                                                 thread_id(), tb_offset_B);
 
-            int my_warp_id = warp_id();
-            int my_lane_id = lane_id();
+            uint8_t my_warp_id = warp_id();
+            uint8_t my_lane_id = lane_id();
 
             // Construct thread-scoped matrix multiply
             Mma mma(shared_storage, thread_id(), my_warp_id, my_lane_id);
@@ -390,12 +390,12 @@ struct AttentionKernel {
             // TODO: We could avoid all this mess using cutlass's Epilogue concept I think
             // but I got lost in templates and reimplemented everything
 
-            const int64_t thread_offset_m = Mma::WarpGemm::kM * iterator_C_offset_m + lane_offset.row();
-            const int64_t thread_offset_n = Mma::WarpGemm::kN * iterator_C_offset_n + lane_offset.column();
+            const int32_t thread_offset_m = Mma::WarpGemm::kM * iterator_C_offset_m + lane_offset.row();
+            const int32_t thread_offset_n = Mma::WarpGemm::kN * iterator_C_offset_n + lane_offset.column();
             scalar_t* output_ptr = &output[query_start()][0];
-            const int64_t output_s0 = output.stride(0);
-            const int64_t max_m = output.size(0) - query_start();
-            const int64_t max_n = output.size(1);
+            const int32_t output_s0 = output.stride(0);
+            const int32_t max_m = output.size(0) - query_start();
+            const int32_t max_n = output.size(1);
 
             // Load data already calculated, and rescale it (as the max value for the softmax might have changed)
             accum.clear();
@@ -450,9 +450,9 @@ struct AttentionKernel {
 
 #if 0
     static __device__ void compute_dot_product_qk(
-        int64_t iter_key_start,
-        at::TensorAccessor<scalar_t, 2> query,
-        at::TensorAccessor<scalar_t, 2> key,
+        int32_t const& iter_key_start,
+        at::TensorAccessor<scalar_t, 2>& query,
+        at::TensorAccessor<scalar_t, 2>& key,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
@@ -499,9 +499,9 @@ struct AttentionKernel {
     }
 #else
     static __device__ void compute_dot_product_qk(
-        int64_t iter_key_start,
-        at::TensorAccessor<scalar_t, 2> query,
-        at::TensorAccessor<scalar_t, 2> key,
+        int32_t const& iter_key_start,
+        at::TensorAccessor<scalar_t, 2>& query,
+        at::TensorAccessor<scalar_t, 2>& key,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
         scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
@@ -581,11 +581,12 @@ struct AttentionKernel {
         __syncthreads();
 
         int64_t num_keys = key.size(0);
-        for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
-            int64_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
-            scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
+        int16_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
+        scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
+        for (int16_t q = 0; q < kQueriesPerBlock; ++q) {
             scalar_t currentMax = m_prime[q];
             if (query_start() + q < num_queries) {
+                CUTLASS_PRAGMA_UNROLL
                 for (int64_t key_id = 0; key_id < kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
                     if (key_offset + key_id >= num_keys) {
                         break;
@@ -632,8 +633,8 @@ struct AttentionKernel {
                                             {problem_size.k(), problem_size.n()},
                                             thread_id(), tb_offset_B);
 
-        int my_warp_id = warp_id();
-        int my_lane_id = lane_id();
+        auto my_warp_id = warp_id();
+        auto my_lane_id = lane_id();
 
         // Construct thread-scoped matrix multiply
         Mma mma(shared_storage, thread_id(), my_warp_id, my_lane_id);
@@ -642,7 +643,7 @@ struct AttentionKernel {
 
         accum.clear();
 
-        int gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+        auto gemm_k_iterations = (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
 
         // Compute threadblock-scoped matrix multiply-add
         mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
@@ -675,16 +676,16 @@ struct AttentionKernel {
         return val;
     }
 
-    static __device__ __forceinline__ int64_t lane_id() {
+    static __device__ __forceinline__ int8_t lane_id() {
         return threadIdx.x;
     }
-    static __device__ __forceinline__ int64_t warp_id() {
+    static __device__ __forceinline__ int8_t warp_id() {
         return threadIdx.y;
     }
-    static __device__ __forceinline__ int64_t thread_id() {
+    static __device__ __forceinline__ int16_t thread_id() {
         return threadIdx.x + threadIdx.y * blockDim.x;
     }
-    static __device__ __forceinline__ int64_t query_start() {
+    static __device__ __forceinline__ int32_t query_start() {
         return blockIdx.y * kQueriesPerBlock;
     }
 };

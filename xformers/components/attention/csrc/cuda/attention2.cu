@@ -195,7 +195,7 @@ struct AttentionKernel {
                 scalar_t my_mi = mi[q][warp_id];
                 static_assert(kNumWarpsPerBlock * kKeysPerWarp % kWarpSize == 0, ".. or add a condition to loop below");
                 for (int32_t key_id = lane_id; key_id < kNumWarpsPerBlock * kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
-                    scalar_t si_exp = std::exp(si[q][key_id] - my_mi) * (key_id < num_keys);
+                    scalar_t si_exp = std::exp(si[q][key_id] - my_mi) * (key_id + iter_key_start < num_keys);
                     sp += si_exp;
                     si[q][key_id] = si_exp;
                 }
@@ -213,10 +213,8 @@ struct AttentionKernel {
             __syncthreads(); // we modify `m_prime` after
 
             // 5. `m_prime` <- `mi`
-            if (warp_id == 0) {
-                for (int64_t q = thread_id(); q < kQueriesPerBlock; q += kWarpSize * kNumWarpsPerBlock) { // parallel lanes
-                    m_prime[q] = mi[q][0];
-                }
+            for (int64_t q = thread_id(); q < kQueriesPerBlock; q += kWarpSize * kNumWarpsPerBlock) { // parallel lanes
+                m_prime[q] = mi[q][0];
             }
         }
 

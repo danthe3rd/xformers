@@ -691,7 +691,14 @@ struct AttentionKernel {
 };
 
 template <typename AK>
-__global__ void attention_kernel_batched(
+__global__ void
+__launch_bounds__(
+    // maxThreadsPerBlock specifies the maximum number of threads per block with which the application will ever launch
+    AK::kWarpSize * AK::kNumWarpsPerBlock,
+    // minBlocksPerMultiprocessor is optional and specifies the desired minimum number of resident blocks per multiprocessor
+    3
+)
+attention_kernel_batched(
     at::PackedTensorAccessor<typename AK::scalar_t, 3> output,
     at::PackedTensorAccessor<typename AK::scalar_t, 2> logsumexp,
     at::PackedTensorAccessor<typename AK::scalar_t, 3> query,

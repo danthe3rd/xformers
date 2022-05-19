@@ -224,47 +224,6 @@ struct AttentionKernel {
         }
     }
 
-#if 0
-    // Naive version
-    static __device__ void compute_dot_product_att_value(
-        iter_key_start const& iter_key_start,
-        at::TensorAccessor<scalar_t, 2> value,
-        scalar_t m_prime[kQueriesPerBlock],
-        scalar_t si[kQueriesPerBlock][kSiDim1],
-        at::TensorAccessor<scalar_t, 2> output
-    ) {
-        int64_t K = value.size(1);
-        scalar_t* value_start_ptr = &value[iter_key_start][0];
-        assert(value.stride(1) == 1);
-
-        scalar_t* output_ptr = &output[query_start()][thread_id()];
-        const int64_t output_stride0 = output.stride(0);
-        assert(output.stride(1) == 1);
-
-        for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
-            scalar_t exp_mprime_mi = m_prime[q];
-
-            for (int64_t value_col = 0; value_col < K; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
-                if (value_col + thread_id() >= K) {
-                    // TODO: Warp divergence if K is not good
-                    break;
-                }
-                scalar_t current_v = 0;
-                scalar_t* value_ptr = value_start_ptr + (value_col + thread_id());
-                for (int64_t k = 0; k < kNumWarpsPerBlock * kKeysPerWarp; ++k) {
-                    // scalar_t current_value = value[iter_key_start + k][value_col + thread_id()];
-                    scalar_t current_value = *(value_ptr + k * K);
-                    scalar_t current_si = si[q][k];
-                    current_v += current_value * current_si; // LONG SCOREBOARD bottleneck
-                }
-                // output[query_start() + q][value_col + thread_id()]
-                scalar_t v_prime = output_ptr[value_col];
-                output_ptr[value_col] = v_prime * exp_mprime_mi + current_v;
-            }
-            output_ptr += output_stride0;
-        }
-    }
-#else
     // cutlass version
     static __device__ void compute_dot_product_att_value(
         int32_t const& iter_key_start,
@@ -430,58 +389,7 @@ struct AttentionKernel {
             }
         }
     }
-#endif
 
-#if 0
-    static __device__ void compute_dot_product_qk(
-        int32_t const& iter_key_start,
-        at::TensorAccessor<scalar_t, 2>& query,
-        at::TensorAccessor<scalar_t, 2>& key,
-        scalar_t m_prime[kQueriesPerBlock],
-        scalar_t si[kQueriesPerBlock][kSiDim1],
-        scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
-    ) {
-        /*
-        Computes the block-matrix product of:
-        (a) query[query_start:query_end, :]
-        with
-        (b) key[iter_key_start:iter_key_start + kNumWarpsPerBlock * kKeysPerWarp]
-        and stores that into `si`
-        */
-        int64_t num_keys = key.size(0);
-        int64_t num_queries = query.size(0);
-        int64_t K = key.size(1);
-
-        scalar_t* key_start_ptr = key.data();
-        int64_t key_stride0 = key.stride(0);
-        scalar_t* query_start_ptr = &query[query_start()][0];
-        int64_t query_stride0 = query.stride(0);
-
-        for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
-            int64_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
-            scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
-            scalar_t currentMax = m_prime[q];
-            if (query_start() + q < num_queries) {
-                for (int64_t key_id = 0; key_id < kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
-                    if (key_offset + key_id >= num_keys) {
-                        break;
-                    }
-                    scalar_t dot_product = 0;
-                    scalar_t* cur_key = key_start_ptr + (key_offset + key_id) * key_stride0;
-                    scalar_t* cur_query = query_start_ptr + q * query_stride0;
-                    for (int64_t k = 0; k < K; ++k) {
-                        dot_product += cur_key[k] * cur_query[k];
-                    }
-                    dot_product *= scale;
-                    si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;
-                    currentMax = std::max(currentMax, dot_product);
-                }
-            }
-            // 2a. At the same time aggregate the max at the warp-level
-            mi[q][warp_id()] = warpMax(currentMax);
-        }
-    }
-#else
     static __device__ void compute_dot_product_qk(
         int32_t const& iter_key_start,
         at::TensorAccessor<scalar_t, 2>& query,
@@ -590,7 +498,6 @@ struct AttentionKernel {
             mi[q + warp_id()] = currentMax;
         }
     }
-#endif
 
     template <typename Mma>
     static __device__ void cutlass_mma(cutlass::gemm::GemmCoord problem_size,

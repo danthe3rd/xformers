@@ -209,17 +209,17 @@ struct AttentionKernel {
 
         // 6. Divide by s_prime all of the values
         const int32_t output_stride0 = output.stride(0);
-        const int32_t iter_col_last = output.size(1) - thread_id();
-        const int32_t iter_query_last = std::min((int32_t)kQueriesPerBlock, int32_t(num_queries - query_start()));
+        const int32_t iter_col_last = output.size(1) - lane_id;
+        const int32_t iter_query_last = std::min<int32_t>((int32_t)kQueriesPerBlock, int32_t(num_queries - warp_id - query_start()));
         if (iter_col_last > 0 && iter_query_last > 0) {
             // &output[query_start()][thread_id]
-            scalar_t* output_line_ptr = output.data() + query_start() * output_stride0 + thread_id();
-            for (int32_t q = 0; q < iter_query_last; ++q) {
-                scalar_t line_s_prime = s_prime[q];
-                for (int32_t value_col = 0; value_col < iter_col_last; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
+            scalar_t* output_line_ptr = output.data() + (query_start() + warp_id) * output_stride0 + lane_id;
+            for (int32_t q = 0; q < iter_query_last; q += kNumWarpsPerBlock) { // parallel warps
+                scalar_t line_s_prime = s_prime[q + warp_id];
+                for (int32_t value_col = 0; value_col < iter_col_last; value_col += kWarpSize) { // parallel lanes
                     output_line_ptr[value_col] /= line_s_prime;
                 }
-                output_line_ptr += output_stride0;
+                output_line_ptr += output_stride0 * kNumWarpsPerBlock;
             }
         }
     }

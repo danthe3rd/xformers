@@ -143,7 +143,7 @@ struct AttentionKernel {
         int32_t K = key.size(1);
 
         scalar_t __shared__ m_prime[kQueriesPerBlock];
-        scalar_t __shared__ mi[kQueriesPerBlock][kNumWarpsPerBlock];
+        scalar_t __shared__ mi[kQueriesPerBlock];
         scalar_t __shared__ s_prime[kQueriesPerBlock];
         scalar_t __shared__ si[kQueriesPerBlock][kSiDim1];
         // ArrayWithBoundsChecks<kQueriesPerBlock> m_prime(m_prime_);
@@ -152,7 +152,7 @@ struct AttentionKernel {
         // ArrayWithBoundsChecks2d<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp> si(si_);
 
         for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
-            mi[q + lane_id][warp_id] = -std::numeric_limits<scalar_t>::infinity();
+            mi[q + lane_id] = -std::numeric_limits<scalar_t>::infinity();
         }
         if (warp_id == 0) {
             for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
@@ -172,17 +172,6 @@ struct AttentionKernel {
             // 1. Compute dot-product into shared memory for each query
             compute_dot_product_qk(iter_key_start, query, key, m_prime, si, mi);
 
-            __syncthreads(); // `mi` calculation done based on warp-data
-
-            // 2b. Aggregate max across different warps
-            for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) { // parallel lanes
-                scalar_t global_max = mi[q + lane_id][0];
-                for(int32_t other_warp = 0; other_warp < kNumWarpsPerBlock; ++other_warp) {
-                    global_max = std::max(global_max, mi[q + lane_id][other_warp]);
-                }
-                mi[q + lane_id][warp_id] = global_max;
-            }
-
             __syncthreads(); // `mi` calculation done based on block data. `mi[a][i] == mi[a][j]` for all (a, i, j)
 
             // TODO: Maybe this could be parallelized across warps
@@ -192,7 +181,7 @@ struct AttentionKernel {
             for (int32_t q = warp_id; q < kQueriesPerBlock; q += kNumWarpsPerBlock) { // parallel warps
                 // 3. Update s_prime
                 scalar_t sp = 0;
-                scalar_t my_mi = mi[q][warp_id];
+                scalar_t my_mi = mi[q];
                 static_assert(kNumWarpsPerBlock * kKeysPerWarp % kWarpSize == 0, ".. or add a condition to loop below");
                 for (int32_t key_id = lane_id; key_id < kNumWarpsPerBlock * kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
                     scalar_t si_exp = std::exp(si[q][key_id] - my_mi) * (key_id + iter_key_start < num_keys);
@@ -209,12 +198,12 @@ struct AttentionKernel {
 
             // 4. Partial matmull with the values we have and V
             // `v* <- v* . exp(m* - mi) + v_i . exp(si - mi)`
-            compute_dot_product_att_value(iter_key_start, value, m_prime, si, mi, output);
+            compute_dot_product_att_value(iter_key_start, value, m_prime, si, output);
             __syncthreads(); // we modify `m_prime` after
 
             // 5. `m_prime` <- `mi`
             for (int64_t q = thread_id(); q < kQueriesPerBlock; q += kWarpSize * kNumWarpsPerBlock) { // parallel lanes
-                m_prime[q] = mi[q][0];
+                m_prime[q] = mi[q];
             }
         }
 
@@ -242,7 +231,6 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> value,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
-        scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock],
         at::TensorAccessor<scalar_t, 2> output
     ) {
         int64_t K = value.size(1);
@@ -254,7 +242,6 @@ struct AttentionKernel {
         assert(output.stride(1) == 1);
 
         for (int64_t q = 0; q < kQueriesPerBlock; ++q) {
-            scalar_t my_mi = mi[q][warp_id()];
             scalar_t exp_mprime_mi = m_prime[q];
 
             for (int64_t value_col = 0; value_col < K; value_col += kNumWarpsPerBlock * kWarpSize) { // parallel warps/lanes
@@ -284,7 +271,6 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2>& value,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
-        scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock],
         at::TensorAccessor<scalar_t, 2>& output
     ) {
         using ThreadblockShape = cutlass::gemm::GemmShape<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp, 8>;
@@ -502,7 +488,7 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2>& key,
         scalar_t m_prime[kQueriesPerBlock],
         scalar_t si[kQueriesPerBlock][kSiDim1],
-        scalar_t mi[kQueriesPerBlock][kNumWarpsPerBlock]
+        scalar_t mi[kQueriesPerBlock]
     ) {
         /*
         Computes the block-matrix product of:
@@ -578,26 +564,30 @@ struct AttentionKernel {
         );
         __syncthreads();
 
+        // 2. Update `mi`
         int64_t num_keys = key.size(0);
-        int16_t key_offset = iter_key_start + warp_id() * kKeysPerWarp + lane_id();
         scalar_t scale = 1.0 / std::sqrt(scalar_t(K));
-        for (int16_t q = 0; q < kQueriesPerBlock; ++q) {
-            scalar_t currentMax = m_prime[q];
-            if (query_start() + q < num_queries) {
-                CUTLASS_PRAGMA_UNROLL
-                for (int64_t key_id = 0; key_id < kKeysPerWarp; key_id += kWarpSize) { // parallel lanes
-                    if (key_offset + key_id >= num_keys) {
-                        break;
-                    }
-                    scalar_t dot_product = si[q][warp_id() * kKeysPerWarp + key_id + lane_id()];
-                    dot_product *= scale;
-                    si[q][warp_id() * kKeysPerWarp + key_id + lane_id()] = dot_product;
-
-                    // 2a. At the same time aggregate the max at the warp-level
-                    currentMax = std::max(currentMax, dot_product);
-                }
+        static_assert(kQueriesPerBlock % kNumWarpsPerBlock == 0);
+        for (int16_t q = 0; q < kQueriesPerBlock; q += kNumWarpsPerBlock) { // parallel warps
+            if (query_start() + q + warp_id() >= num_queries) {
+                continue;
             }
-            mi[q][warp_id()] = warpMax(currentMax);
+            scalar_t currentMax = m_prime[q + warp_id()];
+            CUTLASS_PRAGMA_UNROLL
+            for (int64_t key_id = 0; key_id < kSiDim1; key_id += kWarpSize) { // parallel lanes
+                if (iter_key_start + key_id + lane_id() >= num_keys) {
+                    break;
+                }
+                // TODO: Scaling could be done as part of an epilogue
+                // in the cutlass calculation above
+                scalar_t dot_product = si[q + warp_id()][key_id + lane_id()];
+                dot_product *= scale;
+                si[q + warp_id()][key_id + lane_id()] = dot_product;
+                currentMax = std::max(currentMax, dot_product);
+            }
+
+            currentMax = warpMax(currentMax);
+            mi[q + warp_id()] = currentMax;
         }
     }
 #endif

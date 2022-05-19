@@ -16,14 +16,6 @@
 #include <cstdlib>
 #include <inttypes.h>
 
-/*
-Loops unrolling
-Vec load
-
-Gotchas:
-- Don't use at::TensorAccessor in a loop - super slow
-*/
-
 
 namespace {
 
@@ -125,8 +117,6 @@ struct AttentionKernel {
         at::TensorAccessor<scalar_t, 2> query,
         at::TensorAccessor<scalar_t, 2> key,
         at::TensorAccessor<scalar_t, 2> value) {
-        // int64_t thread_id = threadIdx.x + threadIdx.y * blockDim.x;
-        // int64_t block_dim = blockDim.x * blockDim.y;
     
         int8_t lane_id = threadIdx.x;
         int8_t warp_id = threadIdx.y;
@@ -134,8 +124,6 @@ struct AttentionKernel {
         // In this block, we will only ever:
         // - read query[query_start:query_end, :]
         // - write to output[query_start:query_end, :]
-        // int64_t query_start = blockIdx.y * kQueriesPerBlock;
-        // int64_t query_end = (blockIdx.y + 1) * kQueriesPerBlock;
 
         int32_t num_keys = key.size(0);
         int32_t num_values = value.size(0);
@@ -146,10 +134,6 @@ struct AttentionKernel {
         scalar_t __shared__ mi[kQueriesPerBlock];
         scalar_t __shared__ s_prime[kQueriesPerBlock];
         scalar_t __shared__ si[kQueriesPerBlock][kSiDim1];
-        // ArrayWithBoundsChecks<kQueriesPerBlock> m_prime(m_prime_);
-        // ArrayWithBoundsChecks2d<kQueriesPerBlock, kNumWarpsPerBlock> mi(mi_);
-        // ArrayWithBoundsChecks<kQueriesPerBlock> s_prime(s_prime_);
-        // ArrayWithBoundsChecks2d<kQueriesPerBlock, kNumWarpsPerBlock * kKeysPerWarp> si(si_);
 
         for (int32_t q = 0; q + lane_id < kQueriesPerBlock; q += kWarpSize) {
             mi[q + lane_id] = -std::numeric_limits<scalar_t>::infinity();
@@ -163,10 +147,6 @@ struct AttentionKernel {
 
         // Iterate through keys
         for (int32_t iter_key_start = 0; iter_key_start < num_keys; iter_key_start += kNumWarpsPerBlock * kKeysPerWarp) {
-            // int64_t iter_key_end = iter_key_start + kNumWarpsPerBlock * kKeysPerWarp;
-
-            // TODO(half): Shared memory banks are organized such that successive 32-bit words are assigned to successive banks and the bandwidth is 32 bits per bank per clock cycle
-
             __syncthreads(); // Need to have shared memory initialized, and `m_prime` updated from end of prev iter
 
             // 1. Compute dot-product into shared memory for each query
@@ -174,7 +154,6 @@ struct AttentionKernel {
 
             __syncthreads(); // `mi` calculation done based on block data. `mi[a][i] == mi[a][j]` for all (a, i, j)
 
-            // TODO: Maybe this could be parallelized across warps
             // WARNING: This modifies `si` and `m_prime` to store the precalculated exp version
             // so we can reuse it later in `compute_dot_product_att_value`
             static_assert(kQueriesPerBlock % kNumWarpsPerBlock == 0, ".. or add a condition to loop below");

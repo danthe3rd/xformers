@@ -331,9 +331,8 @@ struct AttentionKernel {
             // Compute threadblock-scoped matrix multiply-add
             mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
 
-            iterate_on_frag<Mma::Operator::IteratorC>(accum, thread_offset_m, thread_offset_n, [&] (float& accum_v, int32_t m, int32_t n) {
+            iterate_on_frag<Mma::Operator::IteratorC>(accum, thread_offset_m, thread_offset_n, [&] (float& accum_v, int32_t const& m, int32_t const& n) {
                 if (m < max_m && n < max_n) {
-                    assert(m >= 0 && n >= 0);
                     output_ptr[m * output_s0 + n] = accum_v;
                 }
             });
@@ -341,7 +340,7 @@ struct AttentionKernel {
     }
 
     template <typename Iterator, typename Fragment, typename FN>
-    static void __device__ iterate_on_frag(Fragment& frag, int32_t offset_m, int32_t offset_n, FN callback) {
+    static void __device__ __forceinline__ iterate_on_frag(Fragment& frag, int32_t const& offset_m, int32_t const& offset_n, FN callback) {
         // TODO: This is quite hacky, and only needed for Simt. For other Mmas, we can use epilogue.
         using Policy = typename Iterator::Policy;
         using Delta = typename Iterator::Delta;
